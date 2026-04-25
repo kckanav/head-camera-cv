@@ -1,0 +1,24 @@
+# Environments
+.venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# Large captures (source video / raw streams) — stored outside git
+*.mp4
+*.h264
+
+# Generated / intermediate outputs
+stitched.jpg
+side_by_side.jpg
+matches.jpg
+stitched_sample.jpg
+sample_clip*.jpg
+clip*_hands.mp4
+clip0.mp4
+clip1.mp4
+
+# Model files (downloaded on demand)
+*.task
