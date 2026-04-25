@@ -6,19 +6,14 @@ __pycache__/
 # OS
 .DS_Store
 
-# Large captures (source video / raw streams) — stored outside git
-*.mp4
+# Raw 4-min recordings and h264 streams — too large for GitHub (>100MB).
+# Kept locally in repo root; switch to git-lfs if you ever need to track them.
+/cam0.mp4
+/cam1.mp4
 *.h264
 
-# Generated / intermediate outputs
-stitched.jpg
-side_by_side.jpg
-matches.jpg
-stitched_sample.jpg
-sample_clip*.jpg
-clip*_hands.mp4
-clip0.mp4
-clip1.mp4
+# Full stitched panorama is ~300MB — track sample frame in outputs/ instead.
+/outputs/*stitched panorama.mp4
 
-# Model files (downloaded on demand)
+# MediaPipe model — re-downloadable, not source.
 *.task

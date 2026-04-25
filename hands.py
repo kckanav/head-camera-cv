@@ -8,7 +8,10 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
+from dated import today_pretty
+
 MODEL_PATH = "hand_landmarker.task"
+TODAY = today_pretty()
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),       # thumb
@@ -86,5 +89,11 @@ def annotate_clip(in_path, out_path):
 
 
 if __name__ == "__main__":
-    annotate_clip("clip0.mp4", "clip0_hands.mp4")
-    annotate_clip("clip1.mp4", "clip1_hands.mp4")
+    annotate_clip(
+        f"inputs/25th April 2026 - cam0 clip 1m40-1m55.mp4",
+        f"outputs/{TODAY} - cam0 hands annotated.mp4",
+    )
+    annotate_clip(
+        f"inputs/25th April 2026 - cam1 clip 1m40-1m55.mp4",
+        f"outputs/{TODAY} - cam1 hands annotated.mp4",
+    )

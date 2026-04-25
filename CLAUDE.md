@@ -13,8 +13,19 @@ Hardware + CV prototype for an egocentric hand-tracking rig:
 
 ## Repo layout (only the non-obvious bits)
 
-- `proecss.py` — the stitching pipeline (filename is a typo of `process.py`; preserve it unless the user asks to rename, since it's referenced from memory).
-- `.venv/` — local Python 3.9 virtualenv, already has `opencv-python` and `numpy` installed. Use it directly; don't recreate.
+- `process.py` — stitching pipeline (panorama video).
+- `hands.py` — MediaPipe HandLandmarker sanity-check pipeline.
+- `dated.py` — tiny helper: `today_pretty()` returns a string like `25th April 2026`. All scripts use this so generated artifacts land in `outputs/` with human-readable dated filenames; re-running the same script on a new day produces a new file rather than overwriting.
+- `inputs/` — tracked test material (reference photos and short clips). Filenames are dated with the **capture** date.
+- `outputs/` — tracked generated artifacts. Filenames are dated with the **generation** date.
+- `.venv/` — local Python 3.9 virtualenv. `opencv-python`, `numpy`, `mediapipe` already installed. Use it directly; don't recreate.
+
+## Files NOT in git (too large)
+
+- `cam0.mp4`, `cam1.mp4` — full 4-min recordings, ~144 MB each (over GitHub's 100 MB limit). Kept locally in repo root; `process.py` reads them from there. Switch the repo to git-lfs if you need to track them.
+- `*.h264` — raw streams from the Pi, same content as the mp4s.
+- `outputs/*stitched panorama.mp4` — the full stitched video is ~300 MB. We commit a sample frame instead; regenerate the video locally with `process.py`.
+- `hand_landmarker.task` — MediaPipe model, re-downloadable from Google's mediapipe-models bucket.
 
 ## Running the stitching pipeline
 

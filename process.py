@@ -14,9 +14,12 @@ import time
 import cv2
 import numpy as np
 
+from dated import today_pretty
+
+# Raw 4-min recordings live in repo root and are gitignored (too large for GitHub).
 LEFT_PATH = "cam1.mp4"
 RIGHT_PATH = "cam0.mp4"
-OUT_PATH = "stitched.mp4"
+OUT_PATH = f"outputs/{today_pretty()} - stitched panorama.mp4"
 
 LOWE_RATIO = 0.75
 RANSAC_REPROJ_THRESH = 4.0
