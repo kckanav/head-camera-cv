@@ -22,7 +22,7 @@ methods are monocular and have to work around that — we won't have to.
   All math now uses the calibrated value, not the design value.
 - **Recovered baseline**: 41.1 mm camera separation.
 - **Raspberry Pi 5** for capture; recording at 1280×720, 30 fps, H.264.
-- CAD source in `dual_picam3_holder.scad`; v2 STL/3MF is the current revision.
+- CAD source in `cad/dual_picam3_holder.scad`; v2 STL/3MF is the current revision.
 
 ## Pipeline plan (staged ladder)
 
@@ -247,34 +247,44 @@ done:
 ## Repo layout
 
 ```
-process.py                   Stitching pipeline (panorama video).
-hands.py                     MediaPipe HandLandmarker sanity-check (stage 1).
-make_calibration_board.py    ChArUco PDF generator (stage 3 input).
-calibrate.py                 Stereo calibration from board videos (stage 3).
-triangulate.py               Sparse 3D hand triangulation (stage 4).
-inspect_3d.py                Trajectory plot of triangulated hand data.
-wilor_sanity.py              WiLoR setup sanity check (stage 8 phase 1).
-wilor_stereo_demo.py         WiLoR per view + stereo wrist triangulation (stage 8 phase 2 + minimal 3).
-dated.py                     today_pretty() helper for dated filenames.
-PLAN.md                      Stage 8 (WiLoR + stereo dexterous hand) plan.
-inputs/                      Tracked test material — filenames dated by capture.
-outputs/                     Tracked generated artefacts — filenames dated by generation.
-*.scad / *.stl / *.3mf       Head-mount CAD.
+README.md / PLAN.md / CLAUDE.md   Docs (read CLAUDE.md before contributing).
+
+scripts/                          All pipeline entry points (run from repo root).
+  process.py                      Stitching pipeline (panorama video).
+  hands.py                        MediaPipe HandLandmarker sanity check (stage 1).
+  make_calibration_board.py       ChArUco PDF generator (stage 3 input).
+  calibrate.py                    Stereo calibration from board videos (stage 3).
+  triangulate.py                  Sparse 3D hand triangulation (stage 4).
+  inspect_3d.py                   Trajectory plot of triangulated hand data.
+  wilor_sanity.py                 WiLoR setup sanity check (stage 8 phase 1).
+  wilor_stereo_demo.py            WiLoR per view + stereo wrist triangulation
+                                  (stage 8 phase 2 + minimal 3).
+  dualstream.py                   Pi-side dual capture + live HTML preview.
+  dated.py                        today_pretty() helper for dated filenames.
+
+cad/                              Head-mount CAD (.scad source + .stl / .3mf exports).
+inputs/                           Tracked test material — filenames dated by capture.
+outputs/                          Tracked generated artefacts — filenames dated by generation.
+
+raw/                              (gitignored) Raw camera mp4 + h264 streams from the Pi.
+models/                           (gitignored) Re-downloadable model weights (e.g. hand_landmarker.task).
+wilor/                            (gitignored) Cloned WiLoR repo — large weights, separate license.
+.venv/                            (gitignored) Python 3.9 venv for stages 1-4.
+.venv-hamer/                      (gitignored) Python 3.10 venv for stage 8.
 ```
 
-Stage 8 also uses a separate Python 3.10 venv at `.venv-hamer/` (gitignored)
-and the cloned WiLoR repo at `wilor/` (gitignored — large weights, separate
-license). See `PLAN.md` for setup commands.
+Run scripts from the repo root so the relative paths in `inputs/` /
+`outputs/` / `models/` resolve correctly: `.venv/bin/python scripts/calibrate.py`.
 
-Filenames look like `27th April 2026 - stereo hands annotated.mp4`. Re-running
-a script on a new day produces a new dated artefact rather than overwriting
-yesterday's, so progress is visually browsable from `ls`.
+Filenames in `inputs/` and `outputs/` look like `27th April 2026 - stereo
+hands annotated.mp4`. Re-running a script on a new day produces a new
+dated artefact rather than overwriting yesterday's, so progress is visually
+browsable from `ls outputs/`.
 
-**Not in git** (over GitHub's 100 MB limit; kept locally only):
-`cam0.mp4`, `cam1.mp4` (144 MB raw 4-min recordings each), the full
-~300 MB stitched panorama, raw `.h264` streams, and the redownloadable
-MediaPipe `.task` model. Switch to **git-lfs** if any of these need to be
-tracked.
+**Not in git** (over GitHub's 100 MB limit, redownloadable, or
+license-restricted; kept locally only): everything in `raw/`, `models/`,
+`wilor/`, and the full stitched panorama / 60-s WiLoR demo renders in
+`outputs/`. Switch to **git-lfs** if any of these need to be tracked.
 
 ## What's next
 

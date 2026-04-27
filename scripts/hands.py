@@ -10,7 +10,7 @@ from mediapipe.tasks.python import vision as mp_vision
 
 from dated import today_pretty
 
-MODEL_PATH = "hand_landmarker.task"
+MODEL_PATH = "models/hand_landmarker.task"
 TODAY = today_pretty()
 
 HAND_CONNECTIONS = [

@@ -10,10 +10,11 @@ wilor/
 # OS
 .DS_Store
 
-# Raw 4-min recordings and h264 streams — too large for GitHub (>100MB).
-# Kept locally in repo root; switch to git-lfs if you ever need to track them.
-/cam0.mp4
-/cam1.mp4
+# Raw camera recordings (mp4 / h264) — too large for GitHub (>100MB),
+# kept locally under raw/. Switch to git-lfs if you ever need to track them.
+/raw/
+
+# h264 streams anywhere in the tree (just in case one lands outside raw/).
 *.h264
 
 # Full stitched panorama is ~300MB — track sample frame in outputs/ instead.

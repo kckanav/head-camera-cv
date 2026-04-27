@@ -84,18 +84,17 @@ import numpy as np
 from ultralytics import YOLO
 
 # --- Path setup
-# WiLoR's repo and python package have an awkward layout on disk:
-#   cameramount/wilor/        (repo root, no __init__.py)
-#     wilor/                  (the actual python package, also no __init__.py)
-#       models/, utils/, ...
-#     models/                 (where the user uploaded MANO_RIGHT.pkl etc.)
-# If PROJECT_ROOT (cameramount/) is on sys.path, Python merges
-# cameramount/wilor/ and cameramount/wilor/wilor/ into a single namespace
-# package, and `wilor.models` then ambiguously resolves between the real
-# package and cameramount/wilor/models (the MANO uploads). Fix: grab dated.py
-# first while PROJECT_ROOT is still on sys.path, then drop PROJECT_ROOT and
-# put WILOR_DIR alone in front.
-PROJECT_ROOT = Path(__file__).resolve().parent
+# WiLoR's repo layout is unusual: cameramount/wilor/ is the repo root and
+# also contains a `models/` directory (where the user dropped MANO_RIGHT.pkl)
+# and a `wilor/` directory (the actual python package, no __init__.py). If
+# the parent dir (cameramount/) were on sys.path, Python would treat
+# cameramount/wilor/ as a namespace package and `wilor.models` would
+# ambiguously resolve to either the MANO drop or the real submodule.
+# Putting only WILOR_DIR on sys.path makes `import wilor.models` resolve
+# unambiguously to cameramount/wilor/wilor/models/.
+from dated import today_pretty   # scripts/dated.py — siblings on sys.path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WILOR_DIR = PROJECT_ROOT / "wilor"
 INPUT_IMG = PROJECT_ROOT / "inputs/24th April 2026 - photo cam0.jpg"
 
@@ -104,14 +103,9 @@ if not WILOR_DIR.is_dir():
 if not INPUT_IMG.is_file():
     sys.exit(f"missing {INPUT_IMG}: input photo not found")
 
-sys.path.insert(0, str(PROJECT_ROOT))
-from dated import today_pretty   # noqa: E402
-
 OUT_OVERLAY = PROJECT_ROOT / f"outputs/{today_pretty()} - wilor sanity overlay.jpg"
 OUT_OBJ = PROJECT_ROOT / f"outputs/{today_pretty()} - wilor sanity hand0.obj"
 
-# Drop PROJECT_ROOT (and any equivalent script-dir entry) before importing wilor.
-sys.path = [p for p in sys.path if Path(p).resolve() != PROJECT_ROOT.resolve()]
 sys.path.insert(0, str(WILOR_DIR))
 os.chdir(WILOR_DIR)
 

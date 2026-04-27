@@ -41,7 +41,7 @@ RIGHT_CLIP = "inputs/25th April 2026 - cam0 first minute.mp4"  # cam0 = right
 OUT_VIDEO = f"outputs/{today_pretty()} - stereo hands annotated.mp4"
 OUT_NPZ = f"outputs/{today_pretty()} - stereo hand 3d.npz"
 
-MODEL_PATH = "hand_landmarker.task"
+MODEL_PATH = "models/hand_landmarker.task"
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),

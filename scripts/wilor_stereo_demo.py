@@ -69,17 +69,15 @@ import numpy as np
 from ultralytics import YOLO
 
 # --- Path setup (same logic as wilor_sanity.py; see comments there) -----------
-PROJECT_ROOT = Path(__file__).resolve().parent
+from dated import today_pretty   # scripts/dated.py — siblings on sys.path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WILOR_DIR = PROJECT_ROOT / "wilor"
-DEFAULT_CALIB = PROJECT_ROOT / "outputs/27th April 2026 - stereo calibration.npz"
+DEFAULT_CALIB = PROJECT_ROOT / "outputs/27th April 2026 wide - stereo calibration.npz"
 
 if not WILOR_DIR.is_dir():
     sys.exit("missing wilor/ - run Phase 0 (env + WiLoR clone) first; see PLAN.md")
 
-sys.path.insert(0, str(PROJECT_ROOT))
-from dated import today_pretty   # noqa: E402
-
-sys.path = [p for p in sys.path if Path(p).resolve() != PROJECT_ROOT.resolve()]
 sys.path.insert(0, str(WILOR_DIR))
 os.chdir(WILOR_DIR)
 

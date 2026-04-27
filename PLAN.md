@@ -5,16 +5,16 @@
 > - Repo state: stages 1, 3, 4 of the main pipeline are committed (MediaPipe per-camera, stereo calibration, sparse 3D triangulation). See `README.md` for the full picture.
 > - Stage 8 status: **Phase 0** (env + WiLoR clone + checkpoints + MANO models linked), **Phase 1** (sanity), and a **minimal Phase 2 + Phase 3** (per-view WiLoR with stereo wrist triangulation) all done.
 > - **Next concrete step:** decide between (a) **proper Phase 3** — fuse all 21 landmarks + scale the WiLoR mesh to metric, not just the wrist; or (b) **better hand-to-hand matching** so the cases where both hands grip the same object stop rejecting; or (c) **run on the 60-s clip** for a richer demo. See "Decisions to make as we go" further down.
-> - Verify the env still works at any time:
+> - Verify the env still works at any time (run from repo root):
 >     ```bash
->     .venv-hamer/bin/python wilor_sanity.py        # single image, fast
->     .venv-hamer/bin/python wilor_stereo_demo.py   # 15-s clip, ~7 min on MPS
+>     .venv-hamer/bin/python scripts/wilor_sanity.py        # single image, fast
+>     .venv-hamer/bin/python scripts/wilor_stereo_demo.py   # 15-s clip, ~7 min on MPS
 >     ```
 >   `wilor_sanity.py` should print "device: mps", detect 1 hand, pop open the overlay.
 >   `wilor_stereo_demo.py` runs through 451 frames at ~1 fps on warm MPS and pops open the side-by-side annotated video at the end.
 > - The WiLoR repo lives at `wilor/` (gitignored — large weights, separate license). If you re-clone it, follow the Phase 0 commands further down. The MANO models live at `wilor/models/MANO_{RIGHT,LEFT}.pkl` (you uploaded them) and are symlinked from `wilor/mano_data/` where the WiLoR config expects them. **Note:** WiLoR only ever loads `MANO_RIGHT.pkl` and uses the standard mirror trick for left hands — `MANO_LEFT.pkl` is symlinked but unused.
-> - Tracked entry points (project root): `wilor_sanity.py`, `wilor_stereo_demo.py`.
-> - Last run results live at `outputs/<date> - wilor sanity *` and `outputs/<date> - wilor stereo demo 15s grease.*`.
+> - Tracked entry points (under `scripts/`): `wilor_sanity.py`, `wilor_stereo_demo.py`.
+> - Last run results live at `outputs/<date> - wilor sanity *` and `outputs/<date> - wilor stereo demo *`.
 
 ---
 
@@ -84,7 +84,7 @@ This is a stronger setup than the default literature pipeline gets.
 - Validate: WiLoR demo runs on a stock sample image, produces a mesh.
 
 ### Phase 1 — single-frame, single-view sanity *(done)*
-- Entry point: `wilor_sanity.py` at the project root.
+- Entry point: `scripts/wilor_sanity.py`.
 - Runs YOLO (CPU — known MPS bug for Pose models) + WiLoR (MPS) on
   `inputs/24th April 2026 - photo cam0.jpg`. Outputs an OpenCV overlay
   (`outputs/<date> - wilor sanity overlay.jpg`) and the MANO mesh as a
@@ -104,8 +104,10 @@ This is a stronger setup than the default literature pipeline gets.
   matplotlib).
 
 ### Phase 2 + minimal Phase 3 — per-view WiLoR with stereo wrist triangulation *(done as one combined demo)*
-- Entry point: `wilor_stereo_demo.py` at the project root. Default runs on the
-  15-s grease clip; pass `--long` for the 60-s clip.
+- Entry point: `scripts/wilor_stereo_demo.py`. Default clip is the 15-s grease
+  clip with the wide-FOV calibration; `--long` switches to the 60-s narrow
+  clip preset. CLI args `--clip-left/--clip-right/--calib/--tag/--max-frames`
+  override paths and limits — relative paths resolve against the repo root.
 - Per frame pair:
   1. YOLO detect on the raw left + right frame (CPU; ultralytics MPS bug).
   2. WiLoR forward pass per detected hand per view (MPS, ~0.9 s warm).
@@ -167,11 +169,11 @@ This is a stronger setup than the default literature pipeline gets.
 
 | Existing | Role going forward |
 |---|---|
-| `dualstream.py` | Pi-side capture, unchanged |
-| `make_calibration_board.py`, `calibrate.py` | Provide the calibration `.npz` that fixes stereo scale — unchanged |
-| `triangulate.py` (MediaPipe stereo) | Kept as **fast preview path** (~37 fps) and as a **regression baseline** — wrist trajectories should agree with WiLoR-stereo |
-| `inspect_3d.py` | Extended in phase 4 for MANO trajectory plots |
-| `process.py` (stitching) | No longer used in main pipeline; reference only |
+| `scripts/dualstream.py` | Pi-side capture, unchanged |
+| `scripts/make_calibration_board.py`, `scripts/calibrate.py` | Provide the calibration `.npz` that fixes stereo scale — unchanged |
+| `scripts/triangulate.py` (MediaPipe stereo) | Kept as **fast preview path** (~37 fps) and as a **regression baseline** — wrist trajectories should agree with WiLoR-stereo |
+| `scripts/inspect_3d.py` | Extended in phase 4 for MANO trajectory plots |
+| `scripts/process.py` (stitching) | No longer used in main pipeline; reference only |
 
 ## Risks & open questions
 
@@ -288,12 +290,12 @@ curl -L -o wilor/pretrained_models/wilor_final.ckpt \
   before the `.to(device)` call. If we keep MPS for Phase 2, that cast goes
   in the per-clip pipeline too.
 - **WiLoR repo layout vs sys.path** — `cameramount/wilor/` and
-  `cameramount/wilor/wilor/` both have no `__init__.py`. If `PROJECT_ROOT`
+  `cameramount/wilor/wilor/` both have no `__init__.py`. If the repo root
   (cameramount/) is on sys.path, Python merges them into a single namespace
   package and `wilor.models` resolves ambiguously (`cameramount/wilor/models/`
   is where the user uploaded MANO files, which isn't a Python package).
-  Sanity script removes PROJECT_ROOT from sys.path and inserts WILOR_DIR
-  alone.
+  After the `scripts/` move, the repo root is no longer on sys.path
+  implicitly; the wilor scripts just insert WILOR_DIR.
 - **Left-hand 2D keypoints come out in flipped-crop coords** —
   `wilor/wilor/datasets/vitdet_dataset.py:62` flips the input crop
   horizontally for left hands (`flip = right == 0`). The network's
