@@ -19,5 +19,8 @@ wilor/
 # Full stitched panorama is ~300MB — track sample frame in outputs/ instead.
 /outputs/*stitched panorama.mp4
 
+# 60-s WiLoR stereo demo render is ~150MB; keep the .npz + perf trace instead.
+/outputs/*wilor stereo demo 60s*.mp4
+
 # MediaPipe model — re-downloadable, not source.
 *.task

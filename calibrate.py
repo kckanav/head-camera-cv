@@ -43,11 +43,15 @@ SAMPLE_EVERY_N_FRAMES = 15  # at 30fps, one pair per 0.5s -> ~120 pairs from 60s
 MIN_CORNERS_PER_VIEW = 8    # both views must see at least this many ChArUco corners
 
 # --- Paths ---
+# A `TAG` is appended to outputs (and required in the input filenames) when we
+# have multiple calibration captures from different sensor configurations
+# (e.g., narrow vs wide FOV). Empty string preserves the original behaviour.
 TODAY = today_pretty()
-LEFT_VIDEO = "inputs/27th April 2026 - cam1 calibration.mp4"   # cam1 = left
-RIGHT_VIDEO = "inputs/27th April 2026 - cam0 calibration.mp4"  # cam0 = right
-OUT_NPZ = f"outputs/{TODAY} - stereo calibration.npz"
-OUT_SANITY = f"outputs/{TODAY} - rectified pair sanity.jpg"
+TAG = " wide"   # set to "" to use the original narrow-FOV inputs
+LEFT_VIDEO = f"inputs/27th April 2026{TAG} - cam1 calibration.mp4"   # cam1 = left
+RIGHT_VIDEO = f"inputs/27th April 2026{TAG} - cam0 calibration.mp4"  # cam0 = right
+OUT_NPZ = f"outputs/{TODAY}{TAG} - stereo calibration.npz"
+OUT_SANITY = f"outputs/{TODAY}{TAG} - rectified pair sanity.jpg"
 
 
 def make_board():

@@ -71,10 +71,10 @@ from ultralytics import YOLO
 # --- Path setup (same logic as wilor_sanity.py; see comments there) -----------
 PROJECT_ROOT = Path(__file__).resolve().parent
 WILOR_DIR = PROJECT_ROOT / "wilor"
-CALIB_PATH = PROJECT_ROOT / "outputs/27th April 2026 - stereo calibration.npz"
+DEFAULT_CALIB = PROJECT_ROOT / "outputs/27th April 2026 - stereo calibration.npz"
 
-if not WILOR_DIR.is_dir() or not CALIB_PATH.is_file():
-    sys.exit("missing wilor/ or stereo calibration .npz - run Phase 0 + calibrate.py first")
+if not WILOR_DIR.is_dir():
+    sys.exit("missing wilor/ - run Phase 0 (env + WiLoR clone) first; see PLAN.md")
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from dated import today_pretty   # noqa: E402
@@ -115,8 +115,8 @@ def to_device(obj, device):
     return obj
 
 
-def load_calib():
-    c = np.load(CALIB_PATH)
+def load_calib(path):
+    c = np.load(path)
     return {
         "K_l": c["K_left"], "dist_l": c["dist_left"],
         "K_r": c["K_right"], "dist_r": c["dist_right"],
@@ -258,9 +258,20 @@ def annotate(img, hand, color, depth_cm=None, paired=True):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--long", action="store_true",
-                        help="use the 60-s 'first minute' clip instead of the 15-s grease clip")
+                        help="default to the 60-s 'first minute' clip instead of the 15-s grease clip")
+    parser.add_argument("--clip-left", type=str, default=None,
+                        help="override left clip path (cam1)")
+    parser.add_argument("--clip-right", type=str, default=None,
+                        help="override right clip path (cam0)")
+    parser.add_argument("--calib", type=str, default=None,
+                        help="override stereo calibration .npz path")
+    parser.add_argument("--tag", type=str, default=None,
+                        help="output filename tag; default is derived from the clip preset")
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="stop after N frames (useful for quick previews)")
     args = parser.parse_args()
 
+    # Defaults from preset flags
     if args.long:
         clip_l = PROJECT_ROOT / "inputs/25th April 2026 - cam1 first minute.mp4"
         clip_r = PROJECT_ROOT / "inputs/25th April 2026 - cam0 first minute.mp4"
@@ -269,6 +280,25 @@ def main():
         clip_l = PROJECT_ROOT / "inputs/25th April 2026 - cam1 clip 1m40-1m55.mp4"
         clip_r = PROJECT_ROOT / "inputs/25th April 2026 - cam0 clip 1m40-1m55.mp4"
         out_tag = "15s grease"
+
+    # CLI paths are interpreted relative to PROJECT_ROOT (not cwd, which by
+    # this point is wilor/ - we chdir'd into it for picamera2 config paths).
+    def from_root(p):
+        pp = Path(p)
+        return pp if pp.is_absolute() else (PROJECT_ROOT / pp).resolve()
+
+    if args.clip_left:
+        clip_l = from_root(args.clip_left)
+    if args.clip_right:
+        clip_r = from_root(args.clip_right)
+    if args.tag:
+        out_tag = args.tag
+
+    calib_path = from_root(args.calib) if args.calib else DEFAULT_CALIB
+    if not calib_path.is_file():
+        sys.exit(f"calibration not found: {calib_path}")
+    if not clip_l.is_file() or not clip_r.is_file():
+        sys.exit(f"clip not found: {clip_l} or {clip_r}")
 
     out_video = PROJECT_ROOT / f"outputs/{today_pretty()} - wilor stereo demo {out_tag}.mp4"
     out_npz = PROJECT_ROOT / f"outputs/{today_pretty()} - wilor stereo demo {out_tag}.npz"
@@ -280,8 +310,9 @@ def main():
     else:
         device = torch.device("cpu")
     print(f"device: {device}   clip: {clip_l.name} / {clip_r.name}")
+    print(f"calibration: {calib_path.name}")
 
-    calib = load_calib()
+    calib = load_calib(calib_path)
     print(f"calibration baseline {calib['baseline_m']*1000:.1f} mm")
 
     print("loading WiLoR ...")
@@ -302,6 +333,8 @@ def main():
     fps = cap_l.get(cv2.CAP_PROP_FPS)
     n = int(min(cap_l.get(cv2.CAP_PROP_FRAME_COUNT),
                 cap_r.get(cv2.CAP_PROP_FRAME_COUNT)))
+    if args.max_frames:
+        n = min(n, args.max_frames)
     w = int(cap_l.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap_l.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"{n} frames @ {fps:.1f} fps, {w}x{h} per camera")
