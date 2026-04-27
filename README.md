@@ -17,9 +17,10 @@ methods are monocular and have to work around that — we won't have to.
 
 - 2× **Raspberry Pi Camera Module 3** mounted on a custom 3D-printed head
   bracket, tilted downward toward the wearer's hands.
-- **24° toe-out** between the two cameras (12° per side off-centre). This
-  geometry gives a wide combined FOV with overlap in the central region where
-  manipulation happens.
+- **Designed 24° toe-out** between the cameras (12° per side off-centre).
+  Stereo calibration **recovered 18.9°** — print tolerances on the bracket.
+  All math now uses the calibrated value, not the design value.
+- **Recovered baseline**: 41.1 mm camera separation.
 - **Raspberry Pi 5** for capture; recording at 1280×720, 30 fps, H.264.
 - CAD source in `dual_picam3_holder.scad`; v2 STL/3MF is the current revision.
 
@@ -33,9 +34,9 @@ the most when you do it next":
 |---|-------|---------|--------|
 | 1 | Per-camera hand keypoints (MediaPipe) | Prove fingers are trackable on real footage | **Done** |
 | 2 | Arm / body pose | Wrist-elbow-shoulder context | Not started |
-| 3 | **Stereo calibration + rectification** | Unlock metric depth for everything below | **Next** |
-| 4 | 3D fingertip triangulation | Per-finger positions in centimetres | Pending stage 3 |
-| 5 | Object segmentation / tracking (SAM 2) | Know which pixels belong to the object | Not started |
+| 3 | Stereo calibration + rectification | Unlock metric depth for everything below | **Done** |
+| 4 | Sparse 3D fingertip triangulation | Per-finger positions in centimetres | **Done** |
+| 5 | Object segmentation / tracking (SAM 2) | Know which pixels belong to the object | **Next** |
 | 6 | Grip event detection (heuristic first) | "Is the hand currently holding it?" | Not started |
 | 7 | Object 6-DoF pose | Orientation, not just position | Optional / later |
 | 8 | Higher-fidelity hand model (HaMeR / WiLoR) | Full MANO mesh per phalanx if MediaPipe limits us | Defer until needed |
@@ -76,7 +77,7 @@ Results on `25th April 2026` test clips:
 Inference runs at ~37 fps on M2 CPU — comfortably faster than real-time, so it
 should work on the Pi 5 too.
 
-### Observations from the annotated outputs
+#### Observations from the annotated outputs
 
 - **Drop rate is ~2–3 % overall**, concentrated in moments where the hand is
   partially out of frame or only a few fingers (e.g. thumb + index + middle)
@@ -87,37 +88,143 @@ should work on the Pi 5 too.
 - **Strong success case**: when the hand is wholly visible — even with heavy
   inter-finger occlusion (both hands gripping a tube of grease, fingers wrapped
   around) — keypoints stay locked at 0.94–0.99 confidence on both cameras.
-- This is good enough to call stage 1 a **proof of concept**: yes, fingers are
-  individually trackable from each camera during close-proximity object
-  interaction.
 
-### Known limitations to keep in mind
+### Stereo calibration (`make_calibration_board.py`, `calibrate.py`)
+
+Stage 3 needed two pieces:
+
+**1. A calibration target.** `make_calibration_board.py` generates a 9×6
+ChArUco board PDF (30 mm squares, 22 mm 5×5 ArUco markers, A4 landscape @
+600 DPI) with a 100 mm scale bar in the margin to verify print scale with a
+ruler.
+
+**2. The calibration itself.** `calibrate.py` takes synchronised left/right
+videos of the board moved by hand in front of a tripod-mounted rig (~40 s of
+footage at 30 fps), then:
+
+- Samples one frame pair every 0.5 s (~80 pairs).
+- Detects ChArUco corners independently in each view.
+- Per-camera intrinsics with `cv2.calibrateCamera`.
+- Stereo extrinsics with `cv2.stereoCalibrate(..., CALIB_FIX_INTRINSIC)`.
+- Rectification with `cv2.stereoRectify(..., alpha=1)`. `alpha=1` preserves
+  the full source FOV (with black padding where rectification has no source
+  pixel) — important on this rig because hands frequently sit near the top
+  edge of the frame; the more-aggressive `alpha=0` cropped them off.
+- Saves intrinsics, extrinsics, rectification rotations, projection matrices,
+  `Q`, and `cv2.remap` lookup tables to `outputs/<date> - stereo
+  calibration.npz`. Renders a side-by-side rectified sample with green
+  scanlines as a visual check (corresponding points must lie on the same
+  scanline).
+
+Result on `27th April 2026` calibration capture (71/79 usable pairs):
+
+| Metric | Result | Bar |
+|---|---|---|
+| cam1 intrinsic rms | 0.24 px | < 0.5 = good |
+| cam0 intrinsic rms | 0.27 px | < 0.5 = good |
+| Stereo rms | 0.26 px | < 1.0 = good |
+| Recovered toe-out | **18.9°** | designed 24° |
+| Recovered baseline | **41.1 mm** | matches the bracket |
+| Recovered focal length | fx ≈ 803 px | matches Pi Cam 3 ~75° HFOV |
+
+Calibration is well below the conservative quality threshold; the rectified
+sanity image (`outputs/<date> - rectified pair sanity.jpg`) confirms scanline
+alignment across both views.
+
+Implied **depth precision** at hand-interaction range (`ΔZ = Z² · Δd / (f · B)`,
+½-px matching):
+
+| Distance | Disparity | Depth precision |
+|---|---|---|
+| 30 cm | 110 px | ~1.4 mm |
+| 50 cm | 66 px | ~3.8 mm |
+| 80 cm | 41 px | ~10 mm |
+
+Single-digit-millimetre depth resolution at hand-interaction range — plenty
+for grip aperture, fingertip positions, and "is the hand touching the object"
+heuristics.
+
+### Sparse 3D hand triangulation (`triangulate.py`, `inspect_3d.py`)
+
+Stage 4 puts everything together:
+
+1. Load the stereo calibration `.npz`.
+2. Rectify each frame pair with the precomputed `cv2.remap` tables.
+3. Run MediaPipe HandLandmarker independently on each rectified view.
+4. Pair left/right hand detections by **wrist-row proximity** — after
+   rectification the epipolar constraint is "same image row", so a true
+   match must agree in y. ±18 px tolerance.
+5. Triangulate the 21 landmarks per paired hand with
+   `cv2.triangulatePoints(P1, P2, ...)` → 3D positions in metres in the
+   left-rectified camera frame.
+6. **Sanity-filter** any pair whose triangulated wrist Z falls outside
+   `[10 cm, 200 cm]` — catches wrong-hand pairings the row check lets through.
+7. Sort hand slots by left-view wrist X for frame-to-frame stability.
+8. Save per-frame `(N_frames, 2, 21, 3)` 3D landmarks (NaN-padded) to
+   `outputs/<date> - stereo hand 3d.npz`.
+9. Write a side-by-side rectified video annotated with skeletons, wrist
+   depth (cm), and pinch (thumb-index) aperture (mm).
+
+`inspect_3d.py` is a small companion that loads the npz and plots wrist
+depth and pinch over time, one curve per hand slot.
+
+Result on the first 60 s of the test recording (alpha=1 rectification):
+
+| Metric | Result |
+|---|---|
+| Hands detected (cam1) | 1689 / 1801 = 94 % |
+| Hands detected (cam0) | 1582 / 1801 = 88 % |
+| Stereo-paired (after Z filter) | 1100 / 1801 = 61 % |
+| Median wrist depth | 33.3 cm |
+| Wrist depth 5–95 pct | 21.6 – 47.0 cm |
+| Median pinch aperture | 36 mm |
+| Inference rate | ~19 fps on M2 CPU (two MediaPipe instances) |
+
+The 5–95 percentile wrist-depth band lies entirely within the expected
+hand-interaction range. The trajectory plot shows clean steady-state
+clustering at ~32 cm during periods of close manipulation, with both hands
+tracked simultaneously.
+
+**Known residual issue.** A single fingertip can occasionally triangulate
+to a wildly wrong Z even when the wrist is solid — MediaPipe's per-finger
+keypoints are noisier than the wrist, and a 1 px disparity error at that
+landmark gives a large depth error. Visible as occasional pinch outliers
+> 150 mm in the trajectory plot. Per-landmark Z-clamping or short-window
+temporal smoothing would clean it up. Not blocking.
+
+### Other known limitations
 
 - **Handedness labels are unreliable** on egocentric video. MediaPipe was
   trained primarily on selfie/forward-facing data, so its `Left` / `Right`
-  classification can flip on top-down head-mount input. The keypoint *positions*
-  themselves are fine. We don't need correct L/R labels for any of stages 3–7,
-  so this is parked for now. Cheap fix: relabel based on which side of the
-  frame the wrist sits on. Proper fix: swap in **HaMeR** or **WiLoR** (both
-  trained on egocentric datasets like Ego4D and EPIC-Kitchens) — that's stage 8.
-- **Parallax artefacts in the stitched panorama** — close-foreground hands sit
-  at a different depth than background and can't be aligned by a single planar
-  homography. Inherent to the geometry, not a bug. Going away once we move to
-  stereo + depth.
+  classification can flip on top-down head-mount input. The keypoint
+  *positions* themselves are fine; we side-step handedness by pairing hands
+  across views via the rectified-row epipolar constraint instead. Cheap fix
+  if we ever need it: relabel based on which side of the frame the wrist
+  sits on. Proper fix: swap in **HaMeR** or **WiLoR** (both trained on
+  egocentric datasets like Ego4D and EPIC-Kitchens) — that's stage 8.
+- **Parallax artefacts in the stitched panorama** — close-foreground hands
+  sit at a different depth than background and can't be aligned by a single
+  planar homography. Inherent to the geometry, not a bug. Going away
+  because we're not stitching anymore — the calibrated stereo pipeline
+  preserves both views.
 
 ## Repo layout
 
 ```
-inputs/    Tracked test material — filenames dated by capture date.
-outputs/   Tracked generated artefacts — filenames dated by generation date.
-process.py Stitching pipeline.
-hands.py   MediaPipe HandLandmarker sanity-check pipeline.
-dated.py   today_pretty() helper for human-readable dated filenames.
-*.scad/.stl/.3mf    Head-mount CAD.
+process.py                   Stitching pipeline (panorama video).
+hands.py                     MediaPipe HandLandmarker sanity-check (stage 1).
+make_calibration_board.py    ChArUco PDF generator (stage 3 input).
+calibrate.py                 Stereo calibration from board videos (stage 3).
+triangulate.py               Sparse 3D hand triangulation (stage 4).
+inspect_3d.py                Trajectory plot of triangulated hand data.
+dated.py                     today_pretty() helper for dated filenames.
+inputs/                      Tracked test material — filenames dated by capture.
+outputs/                     Tracked generated artefacts — filenames dated by generation.
+*.scad / *.stl / *.3mf       Head-mount CAD.
 ```
 
-Filenames look like `25th April 2026 - cam0 hands annotated.mp4`. Re-running a
-script on a new day produces a new dated artefact rather than overwriting
+Filenames look like `27th April 2026 - stereo hands annotated.mp4`. Re-running
+a script on a new day produces a new dated artefact rather than overwriting
 yesterday's, so progress is visually browsable from `ls`.
 
 **Not in git** (over GitHub's 100 MB limit; kept locally only):
@@ -128,31 +235,26 @@ tracked.
 
 ## What's next
 
-**Stage 3 — stereo calibration.** This is the single highest-leverage step
-left. Procedure:
+Stages 3 and 4 are done — we now have calibrated stereo and a working sparse
+3D hand pipeline. Two reasonable directions:
 
-1. Print a checkerboard or ChArUco target (A4 print, mounted flat).
-2. Capture ~30 synchronised image pairs of the target at varied poses (tilted,
-   close, far, off-centre — fill the FOV).
-3. Run `cv2.stereoCalibrate` to recover:
-   - Per-camera intrinsics (focal length, principal point, distortion).
-   - Extrinsics between the two cameras (rotation + translation; should
-     come out near 24° as a sanity check).
-4. Compute rectification maps with `cv2.stereoRectify` so the two streams can
-   be aligned row-by-row.
+**Stage 5 — object segmentation (SAM 2).** Identify which pixels belong to
+the held object so we can ask "which finger is touching what part of it?".
+Combines naturally with the existing 3D hand keypoints to produce per-frame
+hand–object contact features.
 
-Once calibrated, every later stage gets easier: the existing 2D MediaPipe
-keypoints can be triangulated to 3D fingertip positions, dense depth maps
-become available for object analysis, and the parallax problems in the
-stitched panorama go away.
-
-Time estimate: ~30 minutes of capture + ~50 lines of Python, one-time.
-
-After calibration we'll come back to this list and pick stage 4 (triangulate
-the keypoints) or stage 5 (object segmentation) depending on what the
-calibrated data shows.
+**Refine stage 4.** Per-landmark Z-clamping and short-window temporal
+smoothing to clean up the fingertip outliers; identity tracking so hand
+slots stay consistent when hands physically cross; running MediaPipe on the
+*raw* frames and projecting the keypoints through the rectification map
+afterward, to claw back the small detection-rate gap from running on
+rectified frames.
 
 ## Commit history (running log)
 
 - `c9810b2` — initial object detection from both different cameras
 - `5301032` — organise repo into inputs/ and outputs/ with readable dated filenames
+- `02fef54` — README summarising goals, architecture, status, and next step
+- `e63edb9` — hand detection on first minute of each camera
+- `e008189` — generate ChArUco calibration board sized for the Pi Cam 3 rig
+- this branch — stereo calibration (stage 3), sparse 3D hand triangulation (stage 4)
