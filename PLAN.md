@@ -3,20 +3,22 @@
 > **Pick-up-where-we-left-off (read this first if starting a new session):**
 >
 > - Repo state: stages 1, 3, 4 of the main pipeline are committed (MediaPipe per-camera, stereo calibration, sparse 3D triangulation). See `README.md` for the full picture.
-> - Stage 8 status: **Phases 0, 1, 2, and minimal Phase 3 done.** **Per-view AR overlay (`scripts/wilor_ar_overlay.py`) done** — visually validates the monocular mesh quality. **Full Phase 3 in progress**: see "Phase 3 (full) — stereo MANO mesh fusion" further down.
-> - **Phase 3 sub-status**: 3.1 (full keypoint triangulation), 3.2 (Umeyama fusion), and 3.3 (fused-mesh AR overlay) are the minimum viable; 3.4 (LM refinement) and 3.5 (β refinement) are upgrades. The new entry point is `scripts/wilor_phase3.py`.
+> - Stage 8 status: **Phases 0, 1, 2, minimal Phase 3, full Phase 3, and Phase 3 (anchored) all done.**
+> - **Phase 3 (anchored) is the canonical pipeline.** Per view: PnP fits a 6-DOF pose to WiLoR's 2D keypoints; stereo wrist depth supplies a 1-DOF metric scale anchor `k = Z_stereo / t_pnp[2]`. Uniform 3D scaling preserves 2D projection, so the rendered overlay matches `wilor_ar_overlay.py` (median PnP residual ~2 px) while the underlying mesh is metric.
+> - **Phase 3 (full Umeyama)** is kept as a reference experiment. It re-fit the mesh as a global 7-DOF rigid transform — gave one mesh in one frame, but median 2D reprojection error blew up to 10 px (with a 27 px tail), worse than monocular WiLoR. The negative result is committed for posterity.
 > - Verify the env still works at any time (run from repo root):
 >     ```bash
->     .venv-hamer/bin/python scripts/wilor_sanity.py        # single image, fast
->     .venv-hamer/bin/python scripts/wilor_stereo_demo.py   # 15-s clip, ~7 min on MPS
->     .venv-hamer/bin/python scripts/wilor_ar_overlay.py    # per-view monocular AR overlay (10-s wide clip)
->     .venv-hamer/bin/python scripts/wilor_phase3.py        # stereo-fused mesh AR overlay (10-s wide clip)
+>     .venv-hamer/bin/python scripts/wilor_sanity.py             # single image, fast
+>     .venv-hamer/bin/python scripts/wilor_stereo_demo.py        # 15-s clip, ~7 min on MPS
+>     .venv-hamer/bin/python scripts/wilor_ar_overlay.py         # per-view monocular AR (10-s wide clip)
+>     .venv-hamer/bin/python scripts/wilor_phase3.py             # full Umeyama fusion (reference experiment)
+>     .venv-hamer/bin/python scripts/wilor_phase3_anchored.py    # canonical: monocular pose + stereo depth
 >     ```
 >   `wilor_sanity.py` should print "device: mps", detect 1 hand, pop open the overlay.
 >   `wilor_stereo_demo.py` runs through 451 frames at ~1 fps on warm MPS and pops open the side-by-side annotated video at the end.
 > - The WiLoR repo lives at `wilor/` (gitignored — large weights, separate license). If you re-clone it, follow the Phase 0 commands further down. The MANO models live at `wilor/models/MANO_{RIGHT,LEFT}.pkl` (you uploaded them) and are symlinked from `wilor/mano_data/` where the WiLoR config expects them. **Note:** WiLoR only ever loads `MANO_RIGHT.pkl` and uses the standard mirror trick for left hands — `MANO_LEFT.pkl` is symlinked but unused.
-> - Tracked entry points (under `scripts/`): `wilor_sanity.py`, `wilor_stereo_demo.py`, `wilor_ar_overlay.py`, `wilor_phase3.py`.
-> - Last run results live at `outputs/<date> - wilor sanity *`, `outputs/<date> - wilor stereo demo *`, `outputs/<date> - wilor ar overlay *`, `outputs/<date> - phase3 fused *`.
+> - Tracked entry points (under `scripts/`): `wilor_sanity.py`, `wilor_stereo_demo.py`, `wilor_ar_overlay.py`, `wilor_phase3.py`, `wilor_phase3_anchored.py`.
+> - Last run results live at `outputs/<date> - wilor sanity *`, `outputs/<date> - wilor stereo demo *`, `outputs/<date> - wilor ar overlay *`, `outputs/<date> - phase3 fused *`, `outputs/<date> - phase3 anchored *`.
 
 ---
 
@@ -140,12 +142,26 @@ This is a stronger setup than the default literature pipeline gets.
   triangulates all 21 landmarks and fits the entire MANO mesh into the
   shared world frame.
 
-### Phase 3 (full) — stereo MANO mesh fusion *(in progress)*
+### Phase 3 (full Umeyama) — reference experiment *(done, kept for comparison)*
 
-**Goal.** For each frame and each detected hand, produce *one* MANO mesh in
-the rectified-left camera frame at metric scale, consistent with both
-views' WiLoR predictions. Replaces the two independent monocular meshes
-that `wilor_ar_overlay.py` renders.
+**Status.** Built and run on the wide 10-s clip; 596/600 pairs fused (99.3%);
+median 2D reprojection error 10/11 px (left/right) with a 27 px tail.
+**Worse than monocular WiLoR by every visual metric.** Replaced as the
+canonical pipeline by Phase 3 (anchored) below — the negative result is
+kept here so future-you (and future-readers) understands why the simpler
+1-DOF anchor is preferred over the 7-DOF Umeyama refit.
+
+**Why it was worse.** The 7-DOF (s, R, t) re-fit gave us cross-view 3D
+consistency (one mesh, not two) at the cost of breaking WiLoR's per-view
+2D accuracy. Triangulation noise on fingertips at the 41 mm baseline
+propagates into the global rigid transform; weighted Umeyama mitigates
+but doesn't eliminate it. The lesson: don't fight the model. WiLoR was
+trained for monocular 2D + relative 3D and is excellent at that — only
+add what stereo can give that monocular cannot, which is absolute scale.
+
+**Goal (as designed).** For each frame and each detected hand, produce
+*one* MANO mesh in the rectified-left camera frame at metric scale,
+consistent with both views' WiLoR predictions.
 
 **The core unknowns per matched hand per frame: a similarity transform
 (s, R, t) — 7 DOF.** That places WiLoR's MANO output (in its own root-
@@ -221,6 +237,78 @@ fps, image_size, calib_path                   self-contained for downstream code
 - *WiLoR's `pred_keypoints_3d` frame convention* — assumed root-centered
   MANO local. Will verify at runtime by checking `kp3d[0] ≈ 0`.
 
+### Phase 3 (anchored) — monocular pose + stereo metric depth *(canonical)*
+
+**Goal.** Same as Phase 3 (full): produce a metric MANO mesh per matched-hand
+pair. **But solve only what stereo can uniquely give: absolute scale.**
+Trust WiLoR's monocular fit for everything else.
+
+**Algorithm.** Per matched-hand pair, per view:
+
+1. WiLoR forward pass — `pred_vertices` (778, 3 in MANO local frame),
+   `pred_keypoints_3d` (21, 3 same frame, root-centered),
+   `pred_keypoints_2d_full` (21, 2 in real-image pixels).
+2. **`cv2.solvePnP(SQPNP)`** — fit (R_view, t_view) such that
+   `K · (R_view·X_local + t_view)` projects to WiLoR's 2D keypoints.
+   t_view[2] is WiLoR's monocular wrist depth estimate in the real
+   camera frame.
+3. **Stereo triangulate the wrist** in rectified-left frame, then transform
+   into each real camera frame to get `Z_stereo_view`.
+4. **Scalar scale anchor**: `k_view = Z_stereo_view / t_view[2]`. (1 DOF.)
+5. **Metric mesh**: `mesh_metric_view = k_view · (R_view · verts_local + t_view)`,
+   in each real camera frame. Render via `cv2.projectPoints` through
+   (K_view, dist_view).
+
+**Why this works (math).** *Uniform 3D scaling preserves perspective 2D
+projection.* `(X, Y, Z) → (fX/Z, fY/Z)`; scale to `(kX, kY, kZ)` →
+`(fkX/kZ, fkY/kZ)` = same 2D. So we can change the metric size of the
+mesh without breaking WiLoR's pixel-perfect 2D fit. Stereo gives us
+exactly one piece of information that monocular cannot: absolute scale.
+We use it for that, and only that.
+
+**Result on the wide 10-s clip:**
+- 596/600 pairs anchored (99.3%, same as Phase 3 full).
+- **Median 2D reprojection ~2 px** (5–95 [0.9, 6 px]) — visually
+  indistinguishable from `wilor_ar_overlay.py`.
+- Wrist depth median 45.9 cm — agrees with Phase 3 (full) exactly
+  (both pipelines triangulate the same wrist).
+- Per-view scale `k` typically agrees within ~3% (k_L ≈ k_R per frame),
+  which is the genuine cross-view sanity check: stereo is giving us a
+  consistent metric size, not just a depth.
+
+**Output schema (`.npz`):**
+
+```
+verts_3d_world           (N, 2, 778, 3)  metric MANO mesh in rectified-left frame,
+                                          derived from LEFT view (canonical), NaN where missing
+wrist_3d_world           (N, 2, 3)       stereo-triangulated wrist
+pose_R_left              (N, 2, 3, 3)    PnP rotation in original-left cam frame
+pose_t_left              (N, 2, 3)       PnP translation in original-left cam frame
+pose_R_right             (N, 2, 3, 3)    PnP rotation in original-right cam frame
+pose_t_right             (N, 2, 3)       PnP translation in original-right cam frame
+scale_k_left             (N, 2)          1-DOF anchor for left view
+scale_k_right            (N, 2)          1-DOF anchor for right view
+pnp_residual_left_px     (N, 2)          PnP fit quality
+pnp_residual_right_px    (N, 2)          PnP fit quality
+handedness               (N, 2)          strings
+fps, image_size, calib_path                self-contained
+```
+
+**Trade-offs vs Phase 3 (full):**
+
+|   | Phase 3 (full Umeyama) | Phase 3 (anchored) |
+|---|---|---|
+| 2D pixel accuracy | poor (10–27 px) | excellent (1–2 px) |
+| Metric depth | yes | yes |
+| Cross-view 3D agreement | yes by construction (one mesh) | partial — wrists agree, rest may drift slightly |
+| DOF solved with stereo | 7 (s, R, t) | **1 (s only)** |
+| Sensitivity to fingertip triangulation | high | very low (only wrist matters) |
+
+For the dataset we're producing (Phase 5 — robot-training export), the
+canonical 3D representation is `verts_3d_world` from the anchored
+output. The anchored mesh in left-cam frame transformed to world
+(rectified-left) frame is what downstream retargeting code consumes.
+
 ### Phase 4 — visualization & validation
 - Side-by-side rectified video with mesh overlay (extends `triangulate.py`'s
   output style).
@@ -253,7 +341,8 @@ fps, image_size, calib_path                   self-contained for downstream code
 | `scripts/triangulate.py` (MediaPipe stereo) | Kept as **fast preview path** (~37 fps) and as a **regression baseline** — wrist trajectories should agree with WiLoR-stereo |
 | `scripts/wilor_stereo_demo.py` | The **minimal Phase 3** reference (wrist-only stereo). Stays as the regression baseline for the new fused pipeline |
 | `scripts/wilor_ar_overlay.py` | The **per-view monocular** AR overlay. Stays as the regression baseline for visual mesh consistency |
-| `scripts/wilor_phase3.py` | New for the **full Phase 3**: triangulates all 21 landmarks, fuses MANO mesh via Umeyama, renders the same mesh into both views |
+| `scripts/wilor_phase3.py` | The **Phase 3 (full Umeyama)** reference experiment. Stays in the tree as the "we tried 7-DOF refit and it was worse" baseline |
+| `scripts/wilor_phase3_anchored.py` | The **canonical Phase 3**: PnP per view + stereo wrist depth → 1-DOF scale anchor. Renders match `wilor_ar_overlay.py` (uniform scaling preserves 2D); meshes are metric. Phase 5 dataset export consumes this |
 | `scripts/inspect_3d.py` | Extended in phase 4 for MANO trajectory plots |
 | `scripts/process.py` (stitching) | No longer used in main pipeline; reference only |
 
@@ -284,9 +373,12 @@ fps, image_size, calib_path                   self-contained for downstream code
 
 ### Open after Phase 2 + minimal Phase 3
 
-- (a) **Proper Phase 3 — full mesh scale fusion.** *In progress, see the
-  "Phase 3 (full)" section above.* Triangulate all 21 landmarks, fit
-  similarity transform via Umeyama, render same mesh into both views.
+- (a) **Proper Phase 3 — full mesh scale fusion.** *Done both ways.* The
+  Umeyama 7-DOF refit (`wilor_phase3.py`) was tried first and produced
+  worse 2D accuracy than monocular WiLoR. The anchored 1-DOF approach
+  (`wilor_phase3_anchored.py`) preserves WiLoR's 2D and uses stereo only
+  for absolute scale — that's now the canonical pipeline. Both kept in
+  the tree.
 - (b) **Better hand-to-hand matching.** Replace the greedy single-landmark
   match with a multi-landmark Hungarian assignment (use 3–4 stable
   landmarks per hand, not just the wrist). Specifically helps the

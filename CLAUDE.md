@@ -22,7 +22,10 @@ All entry points live in `scripts/`. Everything is run from the **repo root** so
 - `scripts/triangulate.py` — sparse 3D hand triangulation (stage 4). Loads the calibration, rectifies both streams, runs MediaPipe per view, pairs hands by epipolar (rectified-row) proximity, triangulates 21 landmarks per matched hand. Writes an annotated SBS video and a per-frame `(N, 2, 21, 3)` landmarks `.npz`.
 - `scripts/inspect_3d.py` — quick matplotlib visualisation of the triangulated `.npz`: wrist depth + pinch aperture over time.
 - `scripts/wilor_sanity.py` — stage 8 / Phase 1 sanity check. Loads WiLoR + YOLO + MANO, runs them on `inputs/24th April 2026 - photo cam0.jpg`, writes a 2D-keypoint overlay (`outputs/<date> - wilor sanity overlay.jpg`) and the MANO mesh as `.obj`. The script lives in `scripts/` (not inside `wilor/`) so it survives a re-clone of the gitignored WiLoR repo. Has several inline workarounds documented in its docstring (pyrender stub, `torch.load` patch, MPS float64 cast, namespace-package fix via WILOR_DIR-only on sys.path). Run via `.venv-hamer/bin/python scripts/wilor_sanity.py`.
-- `scripts/wilor_stereo_demo.py` — stage 8 / Phase 2 + minimal Phase 3. Loads the stereo calibration `.npz`, runs WiLoR on each view's raw frames (MPS for ViT, CPU for YOLO), pairs hands across views by rectified-row proximity of the wrist, triangulates the wrist with `cv2.triangulatePoints(P1, P2, ...)` for metric depth, writes a side-by-side annotated video plus a per-frame `.npz`. Default calibration is the wide-FOV one; CLI args `--clip-left/--clip-right/--calib/--tag/--max-frames` override the presets, and a `from_root()` helper resolves user-supplied relative paths against the repo root (the script `chdir`s into `wilor/` for picamera2 config paths). Pass `--long` for the 60-s narrow clip preset. Only the **wrist** is triangulated here; full mesh scale fusion is the next chunk of Phase 3.
+- `scripts/wilor_stereo_demo.py` — stage 8 / Phase 2 + minimal Phase 3. Loads the stereo calibration `.npz`, runs WiLoR on each view's raw frames (MPS for ViT, CPU for YOLO), pairs hands across views by rectified-row proximity of the wrist, triangulates the wrist with `cv2.triangulatePoints(P1, P2, ...)` for metric depth, writes a side-by-side annotated video plus a per-frame `.npz`. Default calibration is the wide-FOV one; CLI args `--clip-left/--clip-right/--calib/--tag/--max-frames` override the presets, and a `from_root()` helper resolves user-supplied relative paths against the repo root (the script `chdir`s into `wilor/` for picamera2 config paths). Pass `--long` for the 60-s narrow clip preset. Only the **wrist** is triangulated here.
+- `scripts/wilor_ar_overlay.py` — per-view monocular AR overlay. Runs WiLoR per view, fits a weak-perspective affine (`pred_kp3d.xy` → `pred_kp2d`) per detected hand, applies it to all 778 vertices, rasterizes via painter's algorithm with Lambertian shading. Two independent meshes per frame; the stereo rig isn't doing any work on the mesh itself. Useful as the visual baseline that the Phase 3 experiments are compared against.
+- `scripts/wilor_phase3.py` — **Phase 3 (full Umeyama) reference experiment.** Triangulates all 21 keypoints per matched hand, fits a 7-DOF similarity transform (s, R, t) via weighted Umeyama 1991, projects the same world-frame mesh into both views via `R1.T` (undo rectification) + per-camera `K + dist`. The Umeyama refit gave one mesh in one frame but worse 2D accuracy than monocular WiLoR (median 10 px reproj error). Kept as a reference; not the canonical pipeline.
+- `scripts/wilor_phase3_anchored.py` — **canonical Phase 3.** Per detected hand, per view: `cv2.solvePnP(SQPNP)` fits (R, t) so the mesh in real camera frame projects to WiLoR's 2D keypoints, then a 1-DOF scalar `k = Z_stereo_wrist / t_pnp[2]` anchors the metric scale (uniform 3D scaling preserves perspective 2D, so the rendered overlay matches `wilor_ar_overlay.py`). Saves canonical world-frame metric mesh derived from the LEFT view, plus per-view PnP placement + scale + wrist 3D + PnP residuals for diagnostics.
 - `scripts/dualstream.py` — runs on the Pi 5. Discovers IMX708 sensor modes via `picamera2.sensor_modes`, exposes them as buttons in a live HTML preview UI, and locks capture to 30 fps via `FrameDurationLimits`. Default mode is 2304×1296 (full sensor, ~100° HFOV); the older 1536×864 cropped mode is ~75°. Lives on the Pi but is checked into the repo.
 - `scripts/dated.py` — tiny helper: `today_pretty()` returns a string like `27th April 2026`. All scripts import this so generated artifacts land in `outputs/` with human-readable dated filenames; re-running the same script on a new day produces a new file rather than overwriting.
 - `PLAN.md` — concrete plan for stage 8. Has a "pick-up-where-we-left-off" header at the top so a fresh session can resume. Update this whenever a phase finishes or a decision changes.
@@ -54,11 +57,14 @@ All commands run from the **repo root**:
 .venv/bin/python scripts/calibrate.py         # stereo calibration from board videos in inputs/
 .venv/bin/python scripts/triangulate.py       # sparse 3D hand triangulation; writes SBS video + .npz
 .venv/bin/python scripts/inspect_3d.py        # plot wrist depth + pinch over time from the .npz
-.venv-hamer/bin/python scripts/wilor_sanity.py        # stage 8 sanity check (uses the .venv-hamer Python)
-.venv-hamer/bin/python scripts/wilor_stereo_demo.py   # stage 8 stereo demo, defaults to 15-s grease clip + wide calib
+.venv-hamer/bin/python scripts/wilor_sanity.py             # stage 8 sanity check (uses the .venv-hamer Python)
+.venv-hamer/bin/python scripts/wilor_stereo_demo.py        # stage 8 stereo demo, defaults to 15-s grease clip + wide calib
+.venv-hamer/bin/python scripts/wilor_ar_overlay.py         # per-view monocular AR overlay (visual baseline)
+.venv-hamer/bin/python scripts/wilor_phase3.py             # Phase 3 (full Umeyama) reference experiment
+.venv-hamer/bin/python scripts/wilor_phase3_anchored.py    # canonical Phase 3: monocular pose + stereo depth
 ```
 
-`triangulate.py`, `inspect_3d.py`, `wilor_sanity.py`, and `wilor_stereo_demo.py` `subprocess.run(["open", ...])` their output on macOS so the result pops open after the run.
+The wilor scripts and `triangulate.py`, `inspect_3d.py` all `subprocess.run(["open", ...])` their output on macOS so the result pops open after the run.
 
 ## Pipeline architecture
 
@@ -133,5 +139,32 @@ of WiLoR @ rolpotamias/main + ultralytics 8.1.34 + torch 2.11 on macOS:
   centre).
 
 If any of these stop being needed (upstream pinning newer ultralytics, etc.),
-delete the corresponding workaround in `wilor_sanity.py` and `wilor_stereo_demo.py`
-*and* this note.
+delete the corresponding workaround in `wilor_sanity.py`, `wilor_stereo_demo.py`,
+`wilor_ar_overlay.py`, `wilor_phase3.py`, `wilor_phase3_anchored.py` *and* this note.
+
+### `wilor_phase3_anchored.py` — canonical Phase 3 (monocular pose + stereo depth)
+
+The cleanest way to combine WiLoR's monocular strength with our stereo
+metric depth. Per matched-hand pair per frame:
+
+1. WiLoR per view → `pred_vertices`, `pred_keypoints_3d` (MANO local
+   frame, root-centered), `pred_keypoints_2d_full` (real-image pixels).
+2. `cv2.solvePnP(SQPNP)` per view → (R_view, t_view) such that the mesh
+   in the real camera frame projects to WiLoR's 2D keypoints. This is the
+   monocular wrist depth estimate (= t_view[2]).
+3. Stereo triangulate the wrist in rectified-left frame, transform into
+   each real camera frame to get `Z_stereo_view`.
+4. Scalar scale anchor: `k_view = Z_stereo_view / t_view[2]`. (1 DOF.)
+5. Metric mesh in each real camera frame: `k_view · (R_view · verts_local + t_view)`.
+   Render via `cv2.projectPoints` through (K_view, dist_view).
+
+**Math justification.** Uniform 3D scaling preserves perspective 2D
+projection, so the rendered overlay matches the per-view monocular
+output (`wilor_ar_overlay.py`) with PnP residuals of ~2 px median. The
+1-DOF anchor uses stereo only for the one thing it can give that
+monocular cannot: absolute scale.
+
+**Saved canonical 3D**: `verts_3d_world` is the LEFT view's metric mesh
+transformed to world (rectified-left) frame. PnP placement + scale +
+wrist 3D + PnP residual are saved per view for diagnostics. This `.npz`
+is what Phase 5 (robot-training export) consumes.
