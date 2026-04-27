@@ -3,18 +3,20 @@
 > **Pick-up-where-we-left-off (read this first if starting a new session):**
 >
 > - Repo state: stages 1, 3, 4 of the main pipeline are committed (MediaPipe per-camera, stereo calibration, sparse 3D triangulation). See `README.md` for the full picture.
-> - Stage 8 status: **Phase 0** (env + WiLoR clone + checkpoints + MANO models linked), **Phase 1** (sanity), and a **minimal Phase 2 + Phase 3** (per-view WiLoR with stereo wrist triangulation) all done.
-> - **Next concrete step:** decide between (a) **proper Phase 3** — fuse all 21 landmarks + scale the WiLoR mesh to metric, not just the wrist; or (b) **better hand-to-hand matching** so the cases where both hands grip the same object stop rejecting; or (c) **run on the 60-s clip** for a richer demo. See "Decisions to make as we go" further down.
+> - Stage 8 status: **Phases 0, 1, 2, and minimal Phase 3 done.** **Per-view AR overlay (`scripts/wilor_ar_overlay.py`) done** — visually validates the monocular mesh quality. **Full Phase 3 in progress**: see "Phase 3 (full) — stereo MANO mesh fusion" further down.
+> - **Phase 3 sub-status**: 3.1 (full keypoint triangulation), 3.2 (Umeyama fusion), and 3.3 (fused-mesh AR overlay) are the minimum viable; 3.4 (LM refinement) and 3.5 (β refinement) are upgrades. The new entry point is `scripts/wilor_phase3.py`.
 > - Verify the env still works at any time (run from repo root):
 >     ```bash
 >     .venv-hamer/bin/python scripts/wilor_sanity.py        # single image, fast
 >     .venv-hamer/bin/python scripts/wilor_stereo_demo.py   # 15-s clip, ~7 min on MPS
+>     .venv-hamer/bin/python scripts/wilor_ar_overlay.py    # per-view monocular AR overlay (10-s wide clip)
+>     .venv-hamer/bin/python scripts/wilor_phase3.py        # stereo-fused mesh AR overlay (10-s wide clip)
 >     ```
 >   `wilor_sanity.py` should print "device: mps", detect 1 hand, pop open the overlay.
 >   `wilor_stereo_demo.py` runs through 451 frames at ~1 fps on warm MPS and pops open the side-by-side annotated video at the end.
 > - The WiLoR repo lives at `wilor/` (gitignored — large weights, separate license). If you re-clone it, follow the Phase 0 commands further down. The MANO models live at `wilor/models/MANO_{RIGHT,LEFT}.pkl` (you uploaded them) and are symlinked from `wilor/mano_data/` where the WiLoR config expects them. **Note:** WiLoR only ever loads `MANO_RIGHT.pkl` and uses the standard mirror trick for left hands — `MANO_LEFT.pkl` is symlinked but unused.
-> - Tracked entry points (under `scripts/`): `wilor_sanity.py`, `wilor_stereo_demo.py`.
-> - Last run results live at `outputs/<date> - wilor sanity *` and `outputs/<date> - wilor stereo demo *`.
+> - Tracked entry points (under `scripts/`): `wilor_sanity.py`, `wilor_stereo_demo.py`, `wilor_ar_overlay.py`, `wilor_phase3.py`.
+> - Last run results live at `outputs/<date> - wilor sanity *`, `outputs/<date> - wilor stereo demo *`, `outputs/<date> - wilor ar overlay *`, `outputs/<date> - phase3 fused *`.
 
 ---
 
@@ -134,13 +136,90 @@ This is a stronger setup than the default literature pipeline gets.
   footage (~33 cm), giving us a regression baseline.
 
 **Why this is "minimal" Phase 3 and what's still ahead:**
-- Only the wrist landmark is triangulated. A full Phase 3 should also
-  triangulate palm-base + middle-MCP, compute a per-frame scale factor
-  `s = mean(|triangulated_pair_distance| / |WiLoR_pair_distance|)`, and
-  rescale the **whole 778-vertex MANO mesh** to metric. Then per-frame
-  joint angles can be averaged across views (or confidence-weighted) to
-  denoise.
-- That's the next concrete chunk if we go path (a) below.
+- Only the wrist landmark is triangulated. The full Phase 3 (next section)
+  triangulates all 21 landmarks and fits the entire MANO mesh into the
+  shared world frame.
+
+### Phase 3 (full) — stereo MANO mesh fusion *(in progress)*
+
+**Goal.** For each frame and each detected hand, produce *one* MANO mesh in
+the rectified-left camera frame at metric scale, consistent with both
+views' WiLoR predictions. Replaces the two independent monocular meshes
+that `wilor_ar_overlay.py` renders.
+
+**The core unknowns per matched hand per frame: a similarity transform
+(s, R, t) — 7 DOF.** That places WiLoR's MANO output (in its own root-
+centered local frame) into the rectified-left camera frame. WiLoR's pose θ
+and shape β stay as predicted for the first iteration; β refinement is
+Phase 3.5.
+
+**Algorithm — two steps, the second is optional:**
+
+1. **Umeyama (closed-form)** — triangulate all 21 keypoints to get 21 metric
+   3D points; solve `Σᵢ wᵢ ‖triangulated_3d[i] − (s·R·pred_kp3d_local[i] + t)‖²`
+   via SVD (Umeyama 1991, weighted variant). Closed form, no iteration.
+2. **Levenberg–Marquardt (refinement, Phase 3.4)** — minimize 2D reprojection
+   error across both views over `(s, axis_angle_R, t)` with a robust loss.
+   Initialize from step 1.
+
+**Phased implementation. Each substep is independently testable.**
+
+| Substep | What | Status |
+|---|---|---|
+| 3.1 | Triangulate all 21 keypoints per matched hand. Per-keypoint validity = (rectified-row agreement < 8 px) & (Z plausible). | in progress |
+| 3.2 | Weighted Umeyama. Down-weight fingertips (1 px disparity → big depth error at 41 mm baseline). Apply `(s, R, t)` to all 778 vertices. | in progress |
+| 3.3 | Project the world-frame mesh into both unrectified views via `R1.T` (undo rectification) + `cv2.projectPoints` with `K_l/K_r, dist_l/dist_r`. Render with the same painter's-algorithm code as `wilor_ar_overlay.py`. | in progress |
+| 3.4 | LM refinement of `(s, R, t)` against 2D reprojection error in both views. `scipy.optimize.least_squares` with `loss="soft_l1"`. | deferred |
+| 3.5 | Joint solve over `(s, β, R, t)` — adds shape refinement. Stereo identifies β; monocular β is ill-posed. | deferred |
+| 3.6 | Sequence smoothing. Belongs in Phase 4 if jitter is bothersome. | deferred |
+
+**File plan.** Single new entry point: `scripts/wilor_phase3.py`. Reuses the
+WiLoR detect+regress logic from `wilor_stereo_demo.py` and the painter's-
+algorithm renderer from `wilor_ar_overlay.py` (copied for self-containment;
+shared module is a refactor for later). Outputs:
+
+- `outputs/<date> - phase3 fused [<tag>].npz` — schema below.
+- `outputs/<date> - phase3 ar overlay [<tag>].mp4` — SBS, fused mesh
+  rendered into both **unrectified** frames so it's directly comparable to
+  the per-view monocular `wilor_ar_overlay.py` output.
+
+**Output schema (`.npz`):**
+
+```
+verts_3d_world      (N, 2, 778, 3)  float32 — world (= rectified-left) frame, NaN where missing
+kp_3d_world         (N, 2,  21, 3)  float32 — triangulated, per-keypoint NaN where invalid
+kp_valid            (N, 2,  21)     bool    — row-tolerance + Z-bound mask
+placement_s         (N, 2)          float32 — Umeyama scale
+placement_R         (N, 2,  3, 3)   float32 — Umeyama rotation
+placement_t         (N, 2,  3)      float32 — Umeyama translation
+umeyama_residual_m  (N, 2)          float32 — mean residual after fit, metres
+reproj_err_left_px  (N, 2)          float32 — median 2D error of fused mesh keypoints in left
+reproj_err_right_px (N, 2)          float32 — same for right
+handedness          (N, 2)                  — strings
+fps, image_size, calib_path                   self-contained for downstream code
+```
+
+**Validation (what makes 3.1–3.3 a "success"):**
+
+1. **Reprojection error.** Median < 5 px after Umeyama in both views; > 10 px
+   means coordinate-frame mismatch or wrong-hand pairing.
+2. **Wrist agreement.** Fused mesh's wrist position matches the directly-
+   triangulated wrist (minimal Phase 3) to within 1 mm — same point, two
+   ways.
+3. **Visual.** Fused-mesh AR overlay video shows fingertips landing on the
+   same physical fingertip in both views (which is *not* reliable in
+   `wilor_ar_overlay.py`'s independent per-view meshes).
+
+**Risks and mitigations:**
+
+- *Fingertip triangulation noise* — weighted Umeyama (palm joints heavier).
+- *Cross-view chirality flip* (left view sees "right hand", right view sees
+  "left hand" for the same physical hand) — known issue, document for now,
+  fix by relabeling chirality based on rectified wrist X position.
+- *Outlier hand pairings* — if Umeyama residual > 2 cm, fall back to wrist-
+  only fusion (the minimal Phase 3 result) and flag the frame.
+- *WiLoR's `pred_keypoints_3d` frame convention* — assumed root-centered
+  MANO local. Will verify at runtime by checking `kp3d[0] ≈ 0`.
 
 ### Phase 4 — visualization & validation
 - Side-by-side rectified video with mesh overlay (extends `triangulate.py`'s
@@ -172,6 +251,9 @@ This is a stronger setup than the default literature pipeline gets.
 | `scripts/dualstream.py` | Pi-side capture, unchanged |
 | `scripts/make_calibration_board.py`, `scripts/calibrate.py` | Provide the calibration `.npz` that fixes stereo scale — unchanged |
 | `scripts/triangulate.py` (MediaPipe stereo) | Kept as **fast preview path** (~37 fps) and as a **regression baseline** — wrist trajectories should agree with WiLoR-stereo |
+| `scripts/wilor_stereo_demo.py` | The **minimal Phase 3** reference (wrist-only stereo). Stays as the regression baseline for the new fused pipeline |
+| `scripts/wilor_ar_overlay.py` | The **per-view monocular** AR overlay. Stays as the regression baseline for visual mesh consistency |
+| `scripts/wilor_phase3.py` | New for the **full Phase 3**: triangulates all 21 landmarks, fuses MANO mesh via Umeyama, renders the same mesh into both views |
 | `scripts/inspect_3d.py` | Extended in phase 4 for MANO trajectory plots |
 | `scripts/process.py` (stitching) | No longer used in main pipeline; reference only |
 
@@ -202,17 +284,15 @@ This is a stronger setup than the default literature pipeline gets.
 
 ### Open after Phase 2 + minimal Phase 3
 
-Three reasonable next moves; pick one before continuing:
-
-- (a) **Proper Phase 3 — full mesh scale fusion.** Triangulate wrist + palm-
-  base + middle-MCP, compute scale factor, rescale the 778-vertex mesh to
-  metric, average joint angles across views. The next big quality jump for
-  the dataset.
+- (a) **Proper Phase 3 — full mesh scale fusion.** *In progress, see the
+  "Phase 3 (full)" section above.* Triangulate all 21 landmarks, fit
+  similarity transform via Umeyama, render same mesh into both views.
 - (b) **Better hand-to-hand matching.** Replace the greedy single-landmark
   match with a multi-landmark Hungarian assignment (use 3–4 stable
   landmarks per hand, not just the wrist). Specifically helps the
   "stereo paired but rejected" cases where two hands are gripping the
   same object and their wrists are at near-identical Y in rectified space.
+  Becomes more relevant once Phase 3 is producing reliable per-frame meshes.
 - (c) **Run on the 60-s "first minute" clip.** Same pipeline, just longer
   footage with much more varied interactions. ~30 min wall time. Good
   for evaluating the demo; doesn't change quality.
