@@ -20,6 +20,7 @@ Hardware + CV prototype for an egocentric hand-tracking rig:
 - `triangulate.py` — sparse 3D hand triangulation (stage 4). Loads the calibration, rectifies both streams, runs MediaPipe per view, pairs hands by epipolar (rectified-row) proximity, triangulates 21 landmarks per matched hand. Writes an annotated SBS video and a per-frame `(N, 2, 21, 3)` landmarks `.npz`.
 - `inspect_3d.py` — quick matplotlib visualisation of the triangulated `.npz`: wrist depth + pinch aperture over time.
 - `wilor_sanity.py` — stage 8 / Phase 1 sanity check. Loads WiLoR + YOLO + MANO, runs them on `inputs/24th April 2026 - photo cam0.jpg`, writes a 2D-keypoint overlay (`outputs/<date> - wilor sanity overlay.jpg`) and the MANO mesh as `.obj`. The script intentionally lives at the project root (not inside `wilor/`) so it survives a re-clone of the gitignored WiLoR repo. Has several inline workarounds documented in its docstring (pyrender stub, `torch.load` patch, MPS float64 cast, sys.path namespace-package fix). Run via `.venv-hamer/bin/python wilor_sanity.py`.
+- `wilor_stereo_demo.py` — stage 8 / Phase 2 + minimal Phase 3. Loads the stereo calibration `.npz`, runs WiLoR on each view's raw frames (MPS for ViT, CPU for YOLO), pairs hands across views by rectified-row proximity of the wrist, triangulates the wrist with `cv2.triangulatePoints(P1, P2, ...)` for metric depth, writes a side-by-side annotated video plus a per-frame `.npz`. Default input is the 15-s grease clip; pass `--long` for the 60-s clip. Same workarounds as `wilor_sanity.py`. Only the **wrist** is triangulated here; full mesh scale fusion is the next chunk of Phase 3.
 - `PLAN.md` — concrete plan for stage 8. Has a "pick-up-where-we-left-off" header at the top so a fresh session can resume. Update this whenever a phase finishes or a decision changes.
 - `dated.py` — tiny helper: `today_pretty()` returns a string like `27th April 2026`. All scripts use this so generated artifacts land in `outputs/` with human-readable dated filenames; re-running the same script on a new day produces a new file rather than overwriting.
 - `inputs/` — tracked test material (reference photos, short clips, calibration footage). Filenames are dated with the **capture** date.
@@ -44,10 +45,11 @@ Hardware + CV prototype for an egocentric hand-tracking rig:
 .venv/bin/python calibrate.py         # stereo calibration from board videos in inputs/
 .venv/bin/python triangulate.py       # sparse 3D hand triangulation; writes SBS video + .npz
 .venv/bin/python inspect_3d.py        # plot wrist depth + pinch over time from the .npz
-.venv-hamer/bin/python wilor_sanity.py  # stage 8 sanity check (uses the .venv-hamer Python)
+.venv-hamer/bin/python wilor_sanity.py        # stage 8 sanity check (uses the .venv-hamer Python)
+.venv-hamer/bin/python wilor_stereo_demo.py   # stage 8 stereo demo on 15-s clip; --long for 60-s clip
 ```
 
-`triangulate.py`, `inspect_3d.py`, and `wilor_sanity.py` `subprocess.run(["open", ...])` their output on macOS so the result pops open after the run.
+`triangulate.py`, `inspect_3d.py`, `wilor_sanity.py`, and `wilor_stereo_demo.py` `subprocess.run(["open", ...])` their output on macOS so the result pops open after the run.
 
 ## Pipeline architecture
 
@@ -111,6 +113,14 @@ of WiLoR @ rolpotamias/main + ultralytics 8.1.34 + torch 2.11 on macOS:
   an ambiguous namespace package (the user's MANO uploads at
   `cameramount/wilor/models/` collide with the real package's
   `cameramount/wilor/wilor/models/` otherwise).
+- For left-hand detections, multiply the X coord of `pred_keypoints_2d` and
+  `pred_vertices` by `-1` before mapping back to image coords or saving the
+  mesh. WiLoR's `ViTDetDataset` flips left-hand input crops, so the network
+  output is in flipped-crop space — without un-flipping, the rendered
+  skeleton is mirrored inside the bbox (looks roughly hand-shaped, but
+  thumb/pinky are swapped, and the wrist X is biased toward the bbox
+  centre).
 
 If any of these stop being needed (upstream pinning newer ultralytics, etc.),
-delete the corresponding workaround in `wilor_sanity.py` *and* this note.
+delete the corresponding workaround in `wilor_sanity.py` and `wilor_stereo_demo.py`
+*and* this note.

@@ -196,11 +196,18 @@ def main():
         joints2d = out["pred_keypoints_2d"].detach().cpu().numpy()  # (B, 21, 2) in [-0.5, 0.5]
         for n in range(batch["img"].shape[0]):
             hand_idx = batch_idx * 16 + n
-            handed = "right" if batch["right"][n].item() > 0.5 else "left"
+            is_right = batch["right"][n].item() > 0.5
+            handed = "right" if is_right else "left"
 
+            # ViTDetDataset flips left-hand crops horizontally before
+            # inference, so both pred_vertices and pred_keypoints_2d come
+            # out in flipped-crop coords. Un-flip X to match the original
+            # image / left-hand anatomy.
             v = verts[n].copy()
-            if handed == "left":
-                v[:, 0] *= -1   # MANO is right-handed by convention; mirror left
+            kp_crop = joints2d[n].copy()
+            if not is_right:
+                v[:, 0] *= -1
+                kp_crop[:, 0] *= -1
 
             if not saved_first_obj:
                 save_obj(OUT_OBJ, v, model.mano.faces)
@@ -213,7 +220,7 @@ def main():
 
             box_center = batch["box_center"][n].cpu().numpy()
             box_size = batch["box_size"][n].cpu().item()
-            kp = joints2d[n].copy()
+            kp = kp_crop  # already un-flipped above
             kp[:, 0] = box_center[0] + kp[:, 0] * box_size
             kp[:, 1] = box_center[1] + kp[:, 1] * box_size
             color = (0, 200, 255) if handed == "right" else (255, 100, 0)

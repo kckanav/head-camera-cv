@@ -3,16 +3,18 @@
 > **Pick-up-where-we-left-off (read this first if starting a new session):**
 >
 > - Repo state: stages 1, 3, 4 of the main pipeline are committed (MediaPipe per-camera, stereo calibration, sparse 3D triangulation). See `README.md` for the full picture.
-> - Stage 8 status: **Phase 0 done** (env + WiLoR clone + checkpoints + MANO models linked) and **Phase 1 done** (sanity check passes — WiLoR runs on MPS, mesh extent ~16 cm, handedness correct on a real Pi-Cam frame).
-> - **Next concrete step: Phase 2** — write `wilor_perview.py` to run WiLoR on the raw frames of a clip from `inputs/` and dump per-frame MANO params to `outputs/<date> - cam{0,1} mano raw.npz`.
+> - Stage 8 status: **Phase 0** (env + WiLoR clone + checkpoints + MANO models linked), **Phase 1** (sanity), and a **minimal Phase 2 + Phase 3** (per-view WiLoR with stereo wrist triangulation) all done.
+> - **Next concrete step:** decide between (a) **proper Phase 3** — fuse all 21 landmarks + scale the WiLoR mesh to metric, not just the wrist; or (b) **better hand-to-hand matching** so the cases where both hands grip the same object stop rejecting; or (c) **run on the 60-s clip** for a richer demo. See "Decisions to make as we go" further down.
 > - Verify the env still works at any time:
 >     ```bash
->     .venv-hamer/bin/python wilor_sanity.py
+>     .venv-hamer/bin/python wilor_sanity.py        # single image, fast
+>     .venv-hamer/bin/python wilor_stereo_demo.py   # 15-s clip, ~7 min on MPS
 >     ```
->   Should print "device: mps", detect 1 hand, and pop open the overlay in Preview.
-> - The WiLoR repo lives at `wilor/` (gitignored — large weights, separate license). If you re-clone it, follow the Phase 0 commands further down. The MANO models live at `wilor/models/MANO_{RIGHT,LEFT}.pkl` (you uploaded them) and are symlinked from `wilor/mano_data/` where the WiLoR config expects them.
-> - Sanity script entry point: `wilor_sanity.py` (project root, tracked).
-> - Outputs from the last sanity run: `outputs/<date> - wilor sanity overlay.jpg` and `outputs/<date> - wilor sanity hand0.obj`.
+>   `wilor_sanity.py` should print "device: mps", detect 1 hand, pop open the overlay.
+>   `wilor_stereo_demo.py` runs through 451 frames at ~1 fps on warm MPS and pops open the side-by-side annotated video at the end.
+> - The WiLoR repo lives at `wilor/` (gitignored — large weights, separate license). If you re-clone it, follow the Phase 0 commands further down. The MANO models live at `wilor/models/MANO_{RIGHT,LEFT}.pkl` (you uploaded them) and are symlinked from `wilor/mano_data/` where the WiLoR config expects them. **Note:** WiLoR only ever loads `MANO_RIGHT.pkl` and uses the standard mirror trick for left hands — `MANO_LEFT.pkl` is symlinked but unused.
+> - Tracked entry points (project root): `wilor_sanity.py`, `wilor_stereo_demo.py`.
+> - Last run results live at `outputs/<date> - wilor sanity *` and `outputs/<date> - wilor stereo demo 15s grease.*`.
 
 ---
 
@@ -101,36 +103,42 @@ This is a stronger setup than the default literature pipeline gets.
   visualisation will need a separate path in Phase 4 (probably trimesh or
   matplotlib).
 
-### Phase 2 — per-view, per-clip pipeline
-- New script: `wilor_perview.py`.
-- Loop over **raw** frames (not rectified) — WiLoR was trained on natural
-  imagery, no need to feed it warped pixels. Skipping rectification at this
-  stage also dodges the FOV-loss issue we hit with MediaPipe.
-- Per frame, per view: WiLoR detection + MANO regression for up to 2 hands.
-- Output per view: `outputs/<date> - cam{0,1} mano raw.npz`
-  - `mano_pose[N, 2, 16, 3]` axis-angle joint rotations
-  - `mano_betas[N, 2, 10]` shape parameters
-  - `vertices[N, 2, 778, 3]` in WiLoR's local (un-scaled) frame
-  - `keypoints_2d[N, 2, 21, 2]` reprojected pixel coords for matching/debugging
-  - `confidence[N, 2]` detector score
-  - `bbox[N, 2, 4]` for bookkeeping
+### Phase 2 + minimal Phase 3 — per-view WiLoR with stereo wrist triangulation *(done as one combined demo)*
+- Entry point: `wilor_stereo_demo.py` at the project root. Default runs on the
+  15-s grease clip; pass `--long` for the 60-s clip.
+- Per frame pair:
+  1. YOLO detect on the raw left + right frame (CPU; ultralytics MPS bug).
+  2. WiLoR forward pass per detected hand per view (MPS, ~0.9 s warm).
+  3. Project each hand's wrist 2D into rectified space via
+     `cv2.undistortPoints(..., R=R1|R2, P=P1|P2)`.
+  4. Match left/right hand detections by rectified wrist-row proximity
+     (`ROW_TOL_PX = 30`).
+  5. Triangulate matched wrists with `cv2.triangulatePoints(P1, P2, ...)` →
+     metric wrist 3D in the left rectified camera frame.
+  6. Sanity-filter wrist Z to `[5 cm, 200 cm]`. (5 cm not 10 — on a head-mount
+     hands genuinely get this close when manipulating something near the face.)
+  7. Annotate the SBS frame with the WiLoR skeleton, bbox, handedness label,
+     and the metric `z=XX.X cm` if pairing succeeded.
+- Output:
+  - `outputs/<date> - wilor stereo demo {tag}.mp4` — SBS annotated video.
+  - `outputs/<date> - wilor stereo demo {tag}.npz` — per-frame
+    `wrist_3d_metric[N, 2, 3]`, `keypoints_2d_left/right[N, 2, 21, 2]`,
+    `handedness[N, 2]`.
 
-### Phase 3 — stereo fusion
-- New script: `wilor_stereo.py`.
-- Per frame:
-  1. **Hand correspondence across views** — match L/R detections by epipolar
-     constraint: project palm-centroid through the rectification map, require
-     matched-row alignment within ~20 px (same approach as
-     `triangulate.py`).
-  2. **Scale fusion** — triangulate the wrist + palm-base + middle-MCP
-     keypoints via the calibration's `P1, P2`. Compute scale factor
-     `s = mean(|triangulated_pair_distance| / |WiLoR_pair_distance|)` so
-     the monocular mesh is rescaled to metric ground truth from stereo.
-  3. **Pose fusion** — average the two views' joint angles in axis-angle
-     space (or weight by confidence). Wrist 6DoF taken from the metric
-     stereo triangulation, not from monocular regression.
-- Output: `outputs/<date> - mano stereo fused.npz` — per-frame MANO at
-  metric scale.
+**Result on the 15-s grease clip (451 frames, 7.5 min wall time):**
+- Inference 0.98 s/frame on warm MPS.
+- Wrist depth (cm): median 34.1, 5–95 [6.5, 40.1], min 5.1, max 69.7.
+- Median lines up well with what MediaPipe-stereo reported on similar
+  footage (~33 cm), giving us a regression baseline.
+
+**Why this is "minimal" Phase 3 and what's still ahead:**
+- Only the wrist landmark is triangulated. A full Phase 3 should also
+  triangulate palm-base + middle-MCP, compute a per-frame scale factor
+  `s = mean(|triangulated_pair_distance| / |WiLoR_pair_distance|)`, and
+  rescale the **whole 778-vertex MANO mesh** to metric. Then per-frame
+  joint angles can be averaged across views (or confidence-weighted) to
+  denoise.
+- That's the next concrete chunk if we go path (a) below.
 
 ### Phase 4 — visualization & validation
 - Side-by-side rectified video with mesh overlay (extends `triangulate.py`'s
@@ -183,12 +191,29 @@ This is a stronger setup than the default literature pipeline gets.
 ## Decisions to make as we go
 
 - WiLoR repo location: `wilor/` subdir (gitignored) vs sibling dir.
-  **Default: subdir.**
+  **Default: subdir.** *(decided)*
 - Data format: `.npz` (simple) vs `.h5` (better for big datasets).
   **Default: `.npz` until total dataset > ~1 GB.**
 - Whether to keep MediaPipe pipeline running alongside WiLoR for every clip,
   or only as needed. **Default: alongside, since it's cheap and useful as
   regression check.**
+
+### Open after Phase 2 + minimal Phase 3
+
+Three reasonable next moves; pick one before continuing:
+
+- (a) **Proper Phase 3 — full mesh scale fusion.** Triangulate wrist + palm-
+  base + middle-MCP, compute scale factor, rescale the 778-vertex mesh to
+  metric, average joint angles across views. The next big quality jump for
+  the dataset.
+- (b) **Better hand-to-hand matching.** Replace the greedy single-landmark
+  match with a multi-landmark Hungarian assignment (use 3–4 stable
+  landmarks per hand, not just the wrist). Specifically helps the
+  "stereo paired but rejected" cases where two hands are gripping the
+  same object and their wrists are at near-identical Y in rectified space.
+- (c) **Run on the 60-s "first minute" clip.** Same pipeline, just longer
+  footage with much more varied interactions. ~30 min wall time. Good
+  for evaluating the demo; doesn't change quality.
 
 ## Quick-reference setup commands (Phase 0)
 
@@ -269,6 +294,24 @@ curl -L -o wilor/pretrained_models/wilor_final.ckpt \
   is where the user uploaded MANO files, which isn't a Python package).
   Sanity script removes PROJECT_ROOT from sys.path and inserts WILOR_DIR
   alone.
+- **Left-hand 2D keypoints come out in flipped-crop coords** —
+  `wilor/wilor/datasets/vitdet_dataset.py:62` flips the input crop
+  horizontally for left hands (`flip = right == 0`). The network's
+  `pred_keypoints_2d` and `pred_vertices` therefore come out in flipped
+  coords. To map back to the original image / left-hand anatomy, multiply
+  the X coordinate by `-1` for left hands BEFORE applying
+  `box_center + box_size`. Without this, the rendered skeleton sits at
+  mirrored X positions inside the bbox — looks vaguely hand-shaped (because
+  hands are roughly symmetric) but anatomically wrong (thumb and pinky
+  swapped), and biases the triangulated wrist X toward the bbox center.
+  Bug found and fixed during the stereo demo run; see `wilor_stereo_demo.py`
+  and `wilor_sanity.py`.
+- **YOLO/WiLoR handedness labels are unreliable on egocentric footage** —
+  same finding as MediaPipe (documented in README's "Other known
+  limitations"). The same physical hand can be labelled "right" in one view
+  and "left" in the other. Doesn't affect 3D positions; only the labels.
+  Cheap fix: relabel based on which side of the frame the wrist sits on.
+  Not blocking for Phase 3.
 
 ## Glossary (so future-you doesn't have to look these up)
 

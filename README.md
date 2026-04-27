@@ -192,7 +192,7 @@ landmark gives a large depth error. Visible as occasional pinch outliers
 > 150 mm in the trajectory plot. Per-landmark Z-clamping or short-window
 temporal smoothing would clean it up. Not blocking.
 
-### Stage 8 in progress — WiLoR + stereo dexterous hand pipeline (`wilor_sanity.py`)
+### Stage 8 in progress — WiLoR + stereo dexterous hand pipeline (`wilor_sanity.py`, `wilor_stereo_demo.py`)
 
 The sparse 21-keypoint MediaPipe output is enough for *trajectories* but not
 for retargeting to arbitrary robot grippers. To capture data that can drive
@@ -203,16 +203,30 @@ rotations + 778-vertex mesh) per hand. Stereo gives us an unusual
 advantage: WiLoR is monocular and has scale ambiguity, but our calibrated
 stereo can fix the scale precisely from triangulating wrist/palm landmarks.
 
-Phase 0 (env, weights, MANO) and Phase 1 (sanity check) are done:
+Phase 0 (env, weights, MANO), Phase 1 (sanity), and a combined **Phase 2
++ minimal Phase 3** (per-view WiLoR with stereo wrist triangulation) are
+done:
 
 - WiLoR runs on Apple MPS on this M2 host (with the YOLO detector on CPU
   per a known ultralytics MPS bug).
 - Sanity check on `inputs/24th April 2026 - photo cam0.jpg`: hand detected,
   handedness "right" correct, mesh extent ~16 cm, 2D keypoints overlay
   cleanly on the actual hand.
-- Reproducible from a fresh session via `wilor_sanity.py`. Full plan,
-  install gotchas, and the next phases (per-clip pipeline → stereo fusion →
-  dataset export) are in [`PLAN.md`](PLAN.md).
+- Stereo demo on the 15-s grease-box clip (`inputs/25th April 2026 -
+  cam{0,1} clip 1m40-1m55.mp4`): 451 frames in 7.5 min wall time at
+  ~1 fps on warm MPS. Per-view WiLoR + per-frame wrist triangulation gives
+  metric wrist depth annotations (`z=XX.X cm`) on the side-by-side video.
+  Median wrist depth 34.1 cm, in line with what MediaPipe-stereo
+  reported on similar footage (regression baseline).
+- Discovered and fixed a left-hand keypoint mirroring bug along the way:
+  WiLoR's `ViTDetDataset` flips left-hand input crops, so the 2D keypoint
+  output is in flipped-crop coords — needs un-flipping before being mapped
+  back to the original image. Without the fix, left-hand skeletons render
+  at mirrored X positions and bias triangulated wrist X toward the bbox
+  centre.
+- Reproducible from a fresh session via `wilor_sanity.py` and
+  `wilor_stereo_demo.py`. Full plan, install gotchas, and the next phases
+  (full mesh scale fusion → dataset export) are in [`PLAN.md`](PLAN.md).
 
 ### Other known limitations
 
@@ -240,6 +254,7 @@ calibrate.py                 Stereo calibration from board videos (stage 3).
 triangulate.py               Sparse 3D hand triangulation (stage 4).
 inspect_3d.py                Trajectory plot of triangulated hand data.
 wilor_sanity.py              WiLoR setup sanity check (stage 8 phase 1).
+wilor_stereo_demo.py         WiLoR per view + stereo wrist triangulation (stage 8 phase 2 + minimal 3).
 dated.py                     today_pretty() helper for dated filenames.
 PLAN.md                      Stage 8 (WiLoR + stereo dexterous hand) plan.
 inputs/                      Tracked test material — filenames dated by capture.
@@ -288,4 +303,5 @@ rectified frames.
 - `fa40c85` — stereo calibration (stage 3): script, capture footage, recovered geometry
 - `402af8c` — sparse 3D hand triangulation (stage 4): pipeline, results, trajectory plot
 - `19c7ecd` — README + CLAUDE.md update for stages 3 and 4
-- this branch — stage 8 phase 0+1 (WiLoR setup + sanity)
+- `9f17555` — stage 8 phase 0+1 (WiLoR setup + sanity)
+- this branch — stage 8 phase 2 + minimal phase 3 (per-view WiLoR + stereo wrist triangulation, with left-hand mirror bug fix)
