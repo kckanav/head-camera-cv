@@ -16,9 +16,9 @@ import numpy as np
 
 from dated import today_pretty
 
-# Raw 4-min recordings live in repo root and are gitignored (too large for GitHub).
-LEFT_PATH = "cam1.mp4"
-RIGHT_PATH = "cam0.mp4"
+# Raw 4-min recordings live under raw/ and are gitignored (too large for GitHub).
+LEFT_PATH = "raw/cam1.mp4"
+RIGHT_PATH = "raw/cam0.mp4"
 OUT_PATH = f"outputs/{today_pretty()} - stitched panorama.mp4"
 
 LOWE_RATIO = 0.75

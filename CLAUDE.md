@@ -37,7 +37,7 @@ All entry points live in `scripts/`. Everything is run from the **repo root** so
 
 ## Files NOT in git (too large, redownloadable, or license-restricted)
 
-- `raw/cam0.mp4`, `raw/cam1.mp4` — full 4-min recordings, ~144 MB each (over GitHub's 100 MB limit). `process.py` expects them at the repo root, so update its paths if you regenerate them. Switch the repo to git-lfs if you need to track them.
+- `raw/cam0.mp4`, `raw/cam1.mp4` — full 4-min recordings, ~144 MB each (over GitHub's 100 MB limit). `scripts/process.py` reads them from `raw/`. Switch the repo to git-lfs if you need to track them.
 - `raw/*.h264` — raw streams from the Pi, same content as the mp4s. Mux to mp4 with `ffmpeg -framerate 30 -i <file>.h264 -c copy <file>.mp4` if you need a container with proper timing (raw h264 has no framerate metadata, so `ffprobe` defaults to 60).
 - `outputs/*stitched panorama.mp4` — the full stitched video is ~300 MB. We commit a sample frame instead; regenerate the video locally with `process.py`.
 - `outputs/*wilor stereo demo 60s*.mp4` — the 60-s WiLoR demo render is ~150 MB. The `.npz` and the `wilor 60s perf trace.png` are tracked; re-render the video locally if needed.

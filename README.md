@@ -314,4 +314,6 @@ rectified frames.
 - `402af8c` — sparse 3D hand triangulation (stage 4): pipeline, results, trajectory plot
 - `19c7ecd` — README + CLAUDE.md update for stages 3 and 4
 - `9f17555` — stage 8 phase 0+1 (WiLoR setup + sanity)
-- this branch — stage 8 phase 2 + minimal phase 3 (per-view WiLoR + stereo wrist triangulation, with left-hand mirror bug fix)
+- `5254d62` — stage 8 phase 2 + minimal phase 3 (per-view WiLoR + stereo wrist triangulation, with left-hand mirror bug fix)
+- `d22400f` — stage 8 wide-FOV: dualstream sensor-mode UI, recalibration, demo CLI args, 60-s perf trace
+- `582a596` — restructure root into scripts/ + cad/ + raw/ + models/ for navigability
