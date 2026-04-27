@@ -39,7 +39,7 @@ the most when you do it next":
 | 5 | Object segmentation / tracking (SAM 2) | Know which pixels belong to the object | **Next** |
 | 6 | Grip event detection (heuristic first) | "Is the hand currently holding it?" | Not started |
 | 7 | Object 6-DoF pose | Orientation, not just position | Optional / later |
-| 8 | Higher-fidelity hand model (HaMeR / WiLoR) | Full MANO mesh per phalanx if MediaPipe limits us | Defer until needed |
+| 8 | Dexterous hand capture (WiLoR + stereo) | Full MANO mesh + joint angles, robot-retargeting-ready | **In progress** — see [PLAN.md](PLAN.md) |
 
 ## What we've achieved so far
 
@@ -192,6 +192,28 @@ landmark gives a large depth error. Visible as occasional pinch outliers
 > 150 mm in the trajectory plot. Per-landmark Z-clamping or short-window
 temporal smoothing would clean it up. Not blocking.
 
+### Stage 8 in progress — WiLoR + stereo dexterous hand pipeline (`wilor_sanity.py`)
+
+The sparse 21-keypoint MediaPipe output is enough for *trajectories* but not
+for retargeting to arbitrary robot grippers. To capture data that can drive
+a parallel-jaw, 3-finger, or anthropomorphic robot hand from the same
+recording, we're moving to **WiLoR** ([CVPR 2025](https://github.com/rolpotamias/WiLoR)) —
+an end-to-end ViT model that produces full **MANO** parameters (16 joint
+rotations + 778-vertex mesh) per hand. Stereo gives us an unusual
+advantage: WiLoR is monocular and has scale ambiguity, but our calibrated
+stereo can fix the scale precisely from triangulating wrist/palm landmarks.
+
+Phase 0 (env, weights, MANO) and Phase 1 (sanity check) are done:
+
+- WiLoR runs on Apple MPS on this M2 host (with the YOLO detector on CPU
+  per a known ultralytics MPS bug).
+- Sanity check on `inputs/24th April 2026 - photo cam0.jpg`: hand detected,
+  handedness "right" correct, mesh extent ~16 cm, 2D keypoints overlay
+  cleanly on the actual hand.
+- Reproducible from a fresh session via `wilor_sanity.py`. Full plan,
+  install gotchas, and the next phases (per-clip pipeline → stereo fusion →
+  dataset export) are in [`PLAN.md`](PLAN.md).
+
 ### Other known limitations
 
 - **Handedness labels are unreliable** on egocentric video. MediaPipe was
@@ -217,11 +239,17 @@ make_calibration_board.py    ChArUco PDF generator (stage 3 input).
 calibrate.py                 Stereo calibration from board videos (stage 3).
 triangulate.py               Sparse 3D hand triangulation (stage 4).
 inspect_3d.py                Trajectory plot of triangulated hand data.
+wilor_sanity.py              WiLoR setup sanity check (stage 8 phase 1).
 dated.py                     today_pretty() helper for dated filenames.
+PLAN.md                      Stage 8 (WiLoR + stereo dexterous hand) plan.
 inputs/                      Tracked test material — filenames dated by capture.
 outputs/                     Tracked generated artefacts — filenames dated by generation.
 *.scad / *.stl / *.3mf       Head-mount CAD.
 ```
+
+Stage 8 also uses a separate Python 3.10 venv at `.venv-hamer/` (gitignored)
+and the cloned WiLoR repo at `wilor/` (gitignored — large weights, separate
+license). See `PLAN.md` for setup commands.
 
 Filenames look like `27th April 2026 - stereo hands annotated.mp4`. Re-running
 a script on a new day produces a new dated artefact rather than overwriting
@@ -257,4 +285,7 @@ rectified frames.
 - `02fef54` — README summarising goals, architecture, status, and next step
 - `e63edb9` — hand detection on first minute of each camera
 - `e008189` — generate ChArUco calibration board sized for the Pi Cam 3 rig
-- this branch — stereo calibration (stage 3), sparse 3D hand triangulation (stage 4)
+- `fa40c85` — stereo calibration (stage 3): script, capture footage, recovered geometry
+- `402af8c` — sparse 3D hand triangulation (stage 4): pipeline, results, trajectory plot
+- `19c7ecd` — README + CLAUDE.md update for stages 3 and 4
+- this branch — stage 8 phase 0+1 (WiLoR setup + sanity)

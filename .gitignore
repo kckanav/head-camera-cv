@@ -1,7 +1,11 @@
 # Environments
 .venv/
+.venv-hamer/
 __pycache__/
 *.pyc
+
+# Cloned upstream model repo (WiLoR) — large weights, separate license, redownloadable
+wilor/
 
 # OS
 .DS_Store

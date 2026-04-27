@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Hardware + CV prototype for an egocentric hand-tracking rig:
 
 - **Rig**: head-mounted dual-camera mount, two Raspberry Pi Camera Module 3 sensors on a Raspberry Pi 5, tilted downward toward the wearer's hands. The cameras were *designed* to toe out **24°** from each other, but stereo calibration recovered **18.9°** (print tolerances on the bracket). The recovered baseline is **41.1 mm**. **Use the calibrated geometry from `outputs/<date> - stereo calibration.npz`, not the design value, for any stereo math.**
-- **Goal**: capture the wearer's hand movements and hand-object interactions, then run a CV pipeline. Stages 1 (per-camera MediaPipe), 3 (stereo calibration), and 4 (sparse 3D triangulation of MediaPipe keypoints) are done. Stage 5 (SAM 2 object segmentation) is the planned next step. Full ladder is in the README.
+- **Goal**: capture the wearer's hand movements and hand-object interactions, then run a CV pipeline. Stages 1 (per-camera MediaPipe), 3 (stereo calibration), and 4 (sparse 3D triangulation of MediaPipe keypoints) are done. **Stage 8 (dexterous hand capture via WiLoR + stereo) is now in progress** — Phase 0 (env + weights) and Phase 1 (sanity check) are done. The plan's full state is in `PLAN.md`; read that first when working on stage 8. Full ladder is in `README.md`.
 - **Captured frames**: `inputs/24th April 2026 - photo cam0.jpg` (right) and `inputs/24th April 2026 - photo cam1.jpg` (left) are reference single-frame captures from the actual rig. **Convention used everywhere in this repo: cam1 = left, cam0 = right.**
 - **CAD**: `dual_picam3_holder.scad` (OpenSCAD source) and exported `.stl` / `.3mf` files (`_v2` is the current revision). The CAD only matters when the physical geometry is in question — usually it isn't.
 
@@ -19,10 +19,14 @@ Hardware + CV prototype for an egocentric hand-tracking rig:
 - `calibrate.py` — stereo calibration from videos of the board (stage 3). Writes intrinsics, extrinsics, rectification maps, and `Q` to an `.npz`.
 - `triangulate.py` — sparse 3D hand triangulation (stage 4). Loads the calibration, rectifies both streams, runs MediaPipe per view, pairs hands by epipolar (rectified-row) proximity, triangulates 21 landmarks per matched hand. Writes an annotated SBS video and a per-frame `(N, 2, 21, 3)` landmarks `.npz`.
 - `inspect_3d.py` — quick matplotlib visualisation of the triangulated `.npz`: wrist depth + pinch aperture over time.
+- `wilor_sanity.py` — stage 8 / Phase 1 sanity check. Loads WiLoR + YOLO + MANO, runs them on `inputs/24th April 2026 - photo cam0.jpg`, writes a 2D-keypoint overlay (`outputs/<date> - wilor sanity overlay.jpg`) and the MANO mesh as `.obj`. The script intentionally lives at the project root (not inside `wilor/`) so it survives a re-clone of the gitignored WiLoR repo. Has several inline workarounds documented in its docstring (pyrender stub, `torch.load` patch, MPS float64 cast, sys.path namespace-package fix). Run via `.venv-hamer/bin/python wilor_sanity.py`.
+- `PLAN.md` — concrete plan for stage 8. Has a "pick-up-where-we-left-off" header at the top so a fresh session can resume. Update this whenever a phase finishes or a decision changes.
 - `dated.py` — tiny helper: `today_pretty()` returns a string like `27th April 2026`. All scripts use this so generated artifacts land in `outputs/` with human-readable dated filenames; re-running the same script on a new day produces a new file rather than overwriting.
 - `inputs/` — tracked test material (reference photos, short clips, calibration footage). Filenames are dated with the **capture** date.
 - `outputs/` — tracked generated artifacts. Filenames are dated with the **generation** date.
-- `.venv/` — local Python 3.9 virtualenv. `opencv-python`, `numpy`, `mediapipe`, `matplotlib`, `Pillow` already installed. Use it directly; don't recreate.
+- `.venv/` — local Python 3.9 virtualenv used by stages 1–4. `opencv-python`, `numpy`, `mediapipe`, `matplotlib`, `Pillow` already installed. Use it directly; don't recreate.
+- `.venv-hamer/` — separate Python 3.10 virtualenv used by stage 8. Has `torch` (with MPS), the WiLoR package's deps, plus `dill` and `Cython` (not in WiLoR's `requirements.txt`; needed for the YOLO ckpt and `xtcocotools` build respectively). Don't recreate; if you do, follow the Phase 0 commands in `PLAN.md`.
+- `wilor/` — cloned WiLoR repo, **gitignored** (large weights, separate license). Contains `pretrained_models/{detector.pt, wilor_final.ckpt}` (downloaded from HuggingFace), `models/MANO_{RIGHT,LEFT}.pkl` (uploaded by the user under their MANO academic license), and `mano_data/MANO_{RIGHT,LEFT}.pkl` symlinked from the above (WiLoR's config expects them at `mano_data/`).
 
 ## Files NOT in git (too large or redownloadable)
 
@@ -40,9 +44,10 @@ Hardware + CV prototype for an egocentric hand-tracking rig:
 .venv/bin/python calibrate.py         # stereo calibration from board videos in inputs/
 .venv/bin/python triangulate.py       # sparse 3D hand triangulation; writes SBS video + .npz
 .venv/bin/python inspect_3d.py        # plot wrist depth + pinch over time from the .npz
+.venv-hamer/bin/python wilor_sanity.py  # stage 8 sanity check (uses the .venv-hamer Python)
 ```
 
-`triangulate.py` and `inspect_3d.py` `subprocess.run(["open", ...])` their output on macOS so the result pops open after the run.
+`triangulate.py`, `inspect_3d.py`, and `wilor_sanity.py` `subprocess.run(["open", ...])` their output on macOS so the result pops open after the run.
 
 ## Pipeline architecture
 
@@ -86,3 +91,26 @@ Per frame pair:
 8. Save NaN-padded `(N_frames, 2, 21, 3)` landmarks (plus 2D coords) to `outputs/<date> - stereo hand 3d.npz`.
 
 Known residual: per-fingertip Z is noisier than the wrist; a 1-pixel disparity error on a fingertip gives a large depth error. The wrist Z is solid; pinch aperture has occasional outliers > 150 mm. Per-landmark Z-clamping or short temporal smoothing would clean it up.
+
+### `wilor_sanity.py` — stage 8 phase 1 sanity check
+
+Uses the `.venv-hamer` Python 3.10 venv. Loads YOLO + WiLoR + MANO from
+the gitignored `wilor/` directory, runs them on a real Pi-Cam frame, and
+writes an OpenCV overlay + `.obj` mesh. Several inline workarounds are
+documented in the script's docstring — they target this exact combination
+of WiLoR @ rolpotamias/main + ultralytics 8.1.34 + torch 2.11 on macOS:
+
+- Stub three pyrender-using submodules of `wilor.utils` (no EGL on macOS).
+- Monkey-patch `torch.load` default to `weights_only=False` (PyTorch 2.6
+  flipped this; YOLO ckpt has pickled class refs).
+- Run YOLO on CPU (ultralytics MPS bug for Pose models, issue #4031).
+- Cast `float64` tensors to `float32` before `.to('mps')` (MPS doesn't
+  support `float64`).
+- Drop `PROJECT_ROOT` from `sys.path` and add only `wilor/` so Python
+  doesn't merge `cameramount/wilor/` and `cameramount/wilor/wilor/` into
+  an ambiguous namespace package (the user's MANO uploads at
+  `cameramount/wilor/models/` collide with the real package's
+  `cameramount/wilor/wilor/models/` otherwise).
+
+If any of these stop being needed (upstream pinning newer ultralytics, etc.),
+delete the corresponding workaround in `wilor_sanity.py` *and* this note.
