@@ -126,6 +126,12 @@ def detect_and_regress(detector, model, model_cfg, img, device, cfg, batch_size=
         dataset, batch_size=batch_size, shuffle=False,
         num_workers=cfg["num_workers"], pin_memory=cfg["pin_memory"],
     )
+    # X-mirror for un-flipping left-hand outputs (WiLoR mirrors left-hand
+    # crops at input, so its outputs sit in flipped-crop space). For
+    # rotation matrices the un-flip is R_real = M · R · M with M = diag(-1,1,1):
+    # M is its own inverse, so passive frame mirroring composes that way.
+    M_FLIP = np.diag([-1.0, 1.0, 1.0]).astype(np.float64)
+
     hands = []
     idx = 0
     for batch in loader:
@@ -135,6 +141,15 @@ def detect_and_regress(detector, model, model_cfg, img, device, cfg, batch_size=
         kp2d_arr = out["pred_keypoints_2d"].detach().cpu().numpy()
         verts_arr = out["pred_vertices"].detach().cpu().numpy()
         kp3d_arr = out["pred_keypoints_3d"].detach().cpu().numpy()
+        # MANO params — saved as 3x3 rotation matrices in the model's output
+        # (WiLoR uses pose2rot=False internally). Shapes:
+        #   global_orient: (B, 1, 3, 3)   wrist rotation in MANO-local frame
+        #   hand_pose:     (B, 15, 3, 3)  15 finger joints (MCP/PIP/DIP × 5)
+        #   betas:         (B, 10)        person-specific shape coefficients
+        mano = out["pred_mano_params"]
+        go_arr = mano["global_orient"].detach().cpu().numpy()
+        hp_arr = mano["hand_pose"].detach().cpu().numpy()
+        betas_arr = mano["betas"].detach().cpu().numpy()
         for n in range(batch["img"].shape[0]):
             is_r = batch["right"][n].item() > 0.5
             handed = "right" if is_r else "left"
@@ -144,10 +159,16 @@ def detect_and_regress(detector, model, model_cfg, img, device, cfg, batch_size=
             kp_crop = kp2d_arr[n].copy()
             v = verts_arr[n].copy()
             kp3 = kp3d_arr[n].copy()
+            go = go_arr[n].copy()    # (1, 3, 3)
+            hp = hp_arr[n].copy()    # (15, 3, 3)
+            betas = betas_arr[n].copy()  # (10,)
             if not is_r:
                 kp_crop[:, 0] *= -1
                 v[:, 0] *= -1
                 kp3[:, 0] *= -1
+                # Mirror rotation matrices: R_real = M · R_flipped · M.
+                go = M_FLIP @ go @ M_FLIP
+                hp = M_FLIP @ hp @ M_FLIP
 
             kp_full = np.empty_like(kp_crop)
             kp_full[:, 0] = box_center[0] + kp_crop[:, 0] * box_size
@@ -157,6 +178,9 @@ def detect_and_regress(detector, model, model_cfg, img, device, cfg, batch_size=
                 "kp2d_full": kp_full,
                 "kp3d_local": kp3,
                 "verts_local": v,
+                "mano_global_orient_R": go,
+                "mano_hand_pose_R": hp,
+                "mano_betas": betas,
                 "handed": handed,
                 "bbox": boxes[idx],
                 "box_center": box_center,
@@ -402,6 +426,12 @@ def main():
     pnp_residual_left_px = np.full((n, NSLOT), np.nan, dtype=np.float32)
     pnp_residual_right_px = np.full((n, NSLOT), np.nan, dtype=np.float32)
     handedness = np.full((n, NSLOT), "", dtype=object)
+    # MANO source-of-truth from the LEFT view (the canonical mesh is left-derived).
+    # Saved as rotation matrices for fidelity; the export script converts to
+    # axis-angle for the retargeting-friendly form.
+    mano_global_orient_R = np.full((n, NSLOT, 1, 3, 3), np.nan, dtype=np.float32)
+    mano_hand_pose_R = np.full((n, NSLOT, 15, 3, 3), np.nan, dtype=np.float32)
+    mano_betas = np.full((n, NSLOT, 10), np.nan, dtype=np.float32)
 
     n_pairs = 0
     n_anchored = 0
@@ -488,6 +518,9 @@ def main():
             scale_k_right[i, slot] = k_r
             pnp_residual_left_px[i, slot] = res_l
             pnp_residual_right_px[i, slot] = res_r
+            mano_global_orient_R[i, slot] = h_l["mano_global_orient_R"]
+            mano_hand_pose_R[i, slot] = h_l["mano_hand_pose_R"]
+            mano_betas[i, slot] = h_l["mano_betas"]
             n_anchored += 1
 
             # Project metric meshes through real cameras for rendering.
@@ -542,6 +575,9 @@ def main():
         scale_k_right=scale_k_right,
         pnp_residual_left_px=pnp_residual_left_px,
         pnp_residual_right_px=pnp_residual_right_px,
+        mano_global_orient_R=mano_global_orient_R,
+        mano_hand_pose_R=mano_hand_pose_R,
+        mano_betas=mano_betas,
         handedness=np.array(handedness.tolist()),
         fps=np.array(fps),
         image_size=np.array([w, h]),
