@@ -1,8 +1,8 @@
 """Stereo calibration for the dual Pi Cam 3 head-mounted rig.
 
 Inputs (must be recorded with the rig held still and lens focus locked):
-  inputs/<date> - cam0 calibration.mp4
-  inputs/<date> - cam1 calibration.mp4
+  inputs/<date><tag> - cam0 calibration.mp4
+  inputs/<date><tag> - cam1 calibration.mp4
 
 Procedure:
   1. Sample frame pairs at a fixed interval from the two videos.
@@ -11,7 +11,9 @@ Procedure:
      object/image points (intrinsics + distortion).
   4. Stereo calibration with CALIB_FIX_INTRINSIC (only solve R, T).
   5. Compute rectification maps with cv2.stereoRectify.
-  6. Save everything to outputs/<date> - stereo calibration.npz.
+  6. Save everything to outputs/<gen-date><tag> - stereo calibration.npz,
+     including the input video paths so the calibration → footage link is
+     traceable later.
   7. Render a rectified sample pair with horizontal scan lines so the
      calibration can be verified visually (corresponding points must lie on the
      same horizontal scanline).
@@ -20,8 +22,18 @@ Three numbers to look at after running:
   - Per-camera reprojection error: < 0.5 px good, < 1 px acceptable.
   - Stereo reprojection error: < 1 px good, < 1.5 px acceptable.
   - Recovered camera-to-camera angle: should be near 24 deg (rig spec).
+
+Run:
+  .venv/bin/python scripts/calibration/calibrate_stereo.py
+      # uses defaults: 30th April 2026 wide
+  .venv/bin/python scripts/calibration/calibrate_stereo.py --date "30th April 2026" --tag " wide"
+  .venv/bin/python scripts/calibration/calibrate_stereo.py \\
+      --left "inputs/foo - cam1 calibration.mp4" \\
+      --right "inputs/foo - cam0 calibration.mp4" \\
+      --tag " custom"
 """
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -44,16 +56,13 @@ DICT_ID = aruco.DICT_5X5_50
 SAMPLE_EVERY_N_FRAMES = 15  # at 30fps, one pair per 0.5s -> ~120 pairs from 60s
 MIN_CORNERS_PER_VIEW = 8    # both views must see at least this many ChArUco corners
 
-# --- Paths ---
-# A `TAG` is appended to outputs (and required in the input filenames) when we
-# have multiple calibration captures from different sensor configurations
-# (e.g., narrow vs wide FOV). Empty string preserves the original behaviour.
-TODAY = today_pretty()
-TAG = " wide"   # set to "" to use the original narrow-FOV inputs
-LEFT_VIDEO = f"inputs/27th April 2026{TAG} - cam1 calibration.mp4"   # cam1 = left
-RIGHT_VIDEO = f"inputs/27th April 2026{TAG} - cam0 calibration.mp4"  # cam0 = right
-OUT_NPZ = f"outputs/{TODAY}{TAG} - stereo calibration.npz"
-OUT_SANITY = f"outputs/{TODAY}{TAG} - rectified pair sanity.jpg"
+# --- Path defaults ---
+# CLI overrides below; this is just the "I just typed `python calibrate_stereo.py`"
+# behaviour. A `--tag` is appended to outputs and required in the default input
+# filenames to keep multiple calibration captures (narrow vs wide FOV, different
+# rig revisions) side-by-side in `outputs/`.
+DEFAULT_DATE = "30th April 2026"
+DEFAULT_TAG = " wide"   # set to "" for narrow-FOV inputs
 
 
 def make_board():
@@ -150,8 +159,34 @@ def render_sanity(left, right, K_l, dist_l, K_r, dist_r, R1, R2, P1, P2, image_s
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--date", default=DEFAULT_DATE,
+                    help='capture date prefix for default input filenames, e.g. "30th April 2026"')
+    ap.add_argument("--tag", default=DEFAULT_TAG,
+                    help='filename tag, e.g. " wide" or "" for narrow')
+    ap.add_argument("--left", default=None, help="override left (cam1) video path")
+    ap.add_argument("--right", default=None, help="override right (cam0) video path")
+    args = ap.parse_args()
+
+    left_video = args.left if args.left else f"inputs/{args.date}{args.tag} - cam1 calibration.mp4"
+    right_video = args.right if args.right else f"inputs/{args.date}{args.tag} - cam0 calibration.mp4"
+    if not Path(left_video).is_file() or not Path(right_video).is_file():
+        sys.exit(f"missing input(s):\n  {left_video}\n  {right_video}")
+
+    today = today_pretty()
+    out_npz = f"outputs/{today}{args.tag} - stereo calibration.npz"
+    out_sanity = f"outputs/{today}{args.tag} - rectified pair sanity.jpg"
+
+    print(f"capture date / tag: {args.date} / '{args.tag}'")
+    print(f"left  (cam1):       {left_video}")
+    print(f"right (cam0):       {right_video}")
+    print(f"output npz:         {out_npz}")
+    print(f"output sanity img:  {out_sanity}")
+    print()
+
     print(f"[1/6] Loading frame pairs (every {SAMPLE_EVERY_N_FRAMES}th frame)...")
-    pairs, image_size = collect_frames(LEFT_VIDEO, RIGHT_VIDEO)
+    pairs, image_size = collect_frames(left_video, right_video)
     print(f"      {len(pairs)} pairs, image size {image_size}")
 
     board, _ = make_board()
@@ -216,12 +251,12 @@ def main():
         pairs[sanity_idx][0], pairs[sanity_idx][1],
         K_l, dist_l, K_r, dist_r, R1, R2, P1, P2, image_size,
     )
-    cv2.imwrite(OUT_SANITY, sbs)
-    print(f"      sanity image -> {OUT_SANITY}")
+    cv2.imwrite(out_sanity, sbs)
+    print(f"      sanity image -> {out_sanity}")
 
     print("[6/6] Saving calibration...")
     np.savez(
-        OUT_NPZ,
+        out_npz,
         image_size=np.array(image_size),
         K_left=K_l, dist_left=dist_l,
         K_right=K_r, dist_right=dist_r,
@@ -232,14 +267,20 @@ def main():
         rms_left=np.array(rms_l), rms_right=np.array(rms_r), rms_stereo=np.array(rms_s),
         angle_deg=np.array(angle), baseline_m=np.array(baseline),
         square_m=np.array(SQUARE_M), marker_m=np.array(MARKER_M),
+        # Provenance: which footage was used to compute this calibration.
+        left_video_path=str(left_video),
+        right_video_path=str(right_video),
+        capture_date=args.date,
+        tag=args.tag,
+        generated_on=today,
     )
-    print(f"      -> {OUT_NPZ}")
+    print(f"      -> {out_npz}")
     print()
     print("Verdict:")
     print(f"  per-camera rms: {rms_l:.2f} / {rms_r:.2f} px  (good < 0.5, ok < 1)")
     print(f"  stereo rms:     {rms_s:.2f} px           (good < 1, ok < 1.5)")
     print(f"  angle:          {angle:.1f} deg          (rig spec ~24)")
-    print(f"Open {OUT_SANITY} - same physical points must lie on the same green scanline.")
+    print(f"Open {out_sanity} - same physical points must lie on the same green scanline.")
 
 
 if __name__ == "__main__":
