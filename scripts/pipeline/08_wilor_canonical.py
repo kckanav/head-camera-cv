@@ -43,72 +43,32 @@ Run (.venv-hamer Python only):
 """
 
 import argparse
-import os
 import sys
 import time
-import types
 from pathlib import Path
 
+# _lib bootstrap — must come BEFORE importing torch / wilor.* so wilor_setup's
+# pyrender stubs and torch.load patch take effect.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_lib"))
+import wilor_setup  # noqa: F401, E402  side-effects: stubs + torch.load patch + sys.path + chdir
+from wilor_setup import PROJECT_ROOT, WILOR_DIR, get_mano_faces           # noqa: E402
 
-# --- Workaround 1: pyrender on macOS (same stubs as siblings) -----------------
-class _NoopRenderer:
-    def __init__(self, *a, **kw):
-        pass
+import torch                                                             # noqa: E402
+import cv2                                                               # noqa: E402
+import numpy as np                                                       # noqa: E402
+from ultralytics import YOLO                                             # noqa: E402
 
-    def __getattr__(self, name):
-        raise RuntimeError(f"renderer stubbed; nothing should call {name!r}")
+from dated import today_pretty                                           # noqa: E402
+from device import (pick_device, configure_perf, to_device_safe,         # noqa: E402
+                    autocast_ctx, cuda_sync)
 
-
-def _cam_crop_to_full(*a, **kw):
-    raise RuntimeError("cam_crop_to_full stubbed")
-
-
-for _mod_name, _attrs in [
-    ("wilor.utils.renderer",          {"Renderer": _NoopRenderer, "cam_crop_to_full": _cam_crop_to_full}),
-    ("wilor.utils.mesh_renderer",     {"MeshRenderer": _NoopRenderer}),
-    ("wilor.utils.skeleton_renderer", {"SkeletonRenderer": _NoopRenderer}),
-]:
-    _stub = types.ModuleType(_mod_name)
-    for _k, _v in _attrs.items():
-        setattr(_stub, _k, _v)
-    sys.modules[_mod_name] = _stub
-
-# --- Workaround 2: PyTorch 2.6 weights_only default ---------------------------
-import torch
-
-_orig_torch_load = torch.load
-
-
-def _patched_torch_load(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _orig_torch_load(*args, **kwargs)
-
-
-torch.load = _patched_torch_load
-
-import cv2
-import numpy as np
-from ultralytics import YOLO
-
-# --- Path setup ---------------------------------------------------------------
-from dated import today_pretty   # scripts/dated.py — siblings on sys.path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WILOR_DIR = PROJECT_ROOT / "wilor"
-
-if not WILOR_DIR.is_dir():
-    sys.exit("missing wilor/ - run Phase 0 first; see PLAN.md")
-
-sys.path.insert(0, str(WILOR_DIR))
-os.chdir(WILOR_DIR)
-
-from wilor.models import load_wilor                                   # noqa: E402
-from wilor.datasets.vitdet_dataset import ViTDetDataset                # noqa: E402
+from wilor.models import load_wilor                                      # noqa: E402
+from wilor.datasets.vitdet_dataset import ViTDetDataset                  # noqa: E402
 
 # --- Defaults: the wide 10-s interaction clip --------------------------------
 DEFAULT_LEFT = PROJECT_ROOT / "inputs/27th April 2026 wide - cam1 interaction first 10s.mp4"
 DEFAULT_RIGHT = PROJECT_ROOT / "inputs/27th April 2026 wide - cam0 interaction first 10s.mp4"
-DEFAULT_CALIB = PROJECT_ROOT / "outputs/27th April 2026 wide - stereo calibration.npz"
+DEFAULT_CALIB = PROJECT_ROOT / "outputs/30th April 2026 wide - stereo calibration.npz"
 DEFAULT_TAG = "wide first 10s interaction"
 
 WRIST = 0
@@ -126,19 +86,7 @@ HAND_CONNECTIONS = [
 ]
 
 
-# --- WiLoR helpers (mirror of wilor_phase3.py) --------------------------------
-def to_device(obj, device):
-    if torch.is_tensor(obj):
-        if obj.dtype == torch.float64:
-            obj = obj.to(torch.float32)
-        return obj.to(device)
-    if isinstance(obj, dict):
-        return {k: to_device(v, device) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return type(obj)(to_device(v, device) for v in obj)
-    return obj
-
-
+# --- WiLoR helpers ------------------------------------------------------------
 def load_calib(path):
     c = np.load(path)
     return {
@@ -152,8 +100,17 @@ def load_calib(path):
     }
 
 
-def detect_and_regress(detector, model, model_cfg, img, device, batch_size=8):
-    detections = detector(img, device="cpu", conf=0.3, verbose=False)[0]
+def detect_and_regress(detector, model, model_cfg, img, device, cfg, batch_size=8):
+    """YOLO + WiLoR per view.
+
+    `cfg` is the perf config from configure_perf(device). It controls:
+      - YOLO inference device (CUDA / MPS-CPU / CPU)
+      - ViT input fp16 vs fp32
+      - DataLoader workers + pinned memory (CUDA gets async H2D copy)
+      - ViT autocast dtype (fp16 on CUDA, no autocast on MPS/CPU)
+    Same script, three platforms, no per-platform branches at the call site.
+    """
+    detections = detector(img, device=cfg["yolo_device"], conf=0.3, verbose=False)[0]
     if len(detections) == 0:
         return []
     bboxes, is_right_list = [], []
@@ -163,13 +120,17 @@ def detect_and_regress(detector, model, model_cfg, img, device, batch_size=8):
         bboxes.append(bbox[:4].tolist())
     boxes = np.stack(bboxes)
     right = np.stack(is_right_list)
-    dataset = ViTDetDataset(model_cfg, img, boxes, right, rescale_factor=2.0, fp16=False)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    dataset = ViTDetDataset(model_cfg, img, boxes, right,
+                            rescale_factor=2.0, fp16=cfg["fp16"])
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=False,
+        num_workers=cfg["num_workers"], pin_memory=cfg["pin_memory"],
+    )
     hands = []
     idx = 0
     for batch in loader:
-        batch = to_device(batch, device)
-        with torch.no_grad():
+        batch = to_device_safe(batch, device)
+        with torch.inference_mode(), autocast_ctx(device, cfg["autocast_dtype"]):
             out = model(batch)
         kp2d_arr = out["pred_keypoints_2d"].detach().cpu().numpy()
         verts_arr = out["pred_vertices"].detach().cpu().numpy()
@@ -269,14 +230,22 @@ def triangulate_wrist_world(h_l, h_r, calib):
 # --- PnP + anchor scale -------------------------------------------------------
 def solve_pnp(kp3d_local, kp2d_full, K, dist):
     """SQPNP: find (R, t) such that K·(R·kp3d_local + t) -> kp2d_full.
-    Returns (R 3x3, t 3, residual_px) or None on failure."""
+    Returns (R 3x3, t 3, residual_px) or None on failure.
+
+    OpenCV 4.13's SQPNP raises a C++ assertion when point_coordinate_variance
+    falls below a threshold (degenerate hand: occluded or nearly coplanar
+    keypoints). Catch it and return None so the pipeline skips that hand
+    instead of crashing — the caller already handles None.
+    """
     obj_pts = kp3d_local.astype(np.float64).reshape(-1, 1, 3)
     img_pts = kp2d_full.astype(np.float64).reshape(-1, 1, 2)
-    ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist, flags=cv2.SOLVEPNP_SQPNP)
+    try:
+        ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist, flags=cv2.SOLVEPNP_SQPNP)
+    except cv2.error:
+        return None
     if not ok:
         return None
     R, _ = cv2.Rodrigues(rvec)
-    # Reprojection residual
     proj, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, dist)
     proj = proj.reshape(-1, 2)
     residual_px = float(np.median(np.linalg.norm(proj - kp2d_full, axis=1)))
@@ -350,17 +319,6 @@ def annotate_label(img, hand, color, depth_cm=None, k=None, pnp_px=None):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
 
-def get_mano_faces(model):
-    for attr in ("mano", "mano_layer", "smpl", "body_model"):
-        m = getattr(model, attr, None)
-        if m is not None and hasattr(m, "faces"):
-            return np.asarray(m.faces, dtype=np.int32)
-    import pickle
-    with open(WILOR_DIR / "mano_data" / "MANO_RIGHT.pkl", "rb") as f:
-        mano_right = pickle.load(f, encoding="latin1")
-    return np.asarray(mano_right["f"], dtype=np.int32)
-
-
 # --- Main pipeline ------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -374,6 +332,9 @@ def main():
     ap.add_argument("--no-mesh", action="store_true",
                     help="skip mesh raster; skeleton + label only")
     ap.add_argument("--no-edges", action="store_true")
+    ap.add_argument("--bench", action="store_true",
+                    help="print per-stage timings (YOLO+ViT, fusion, render, IO) "
+                         "with cuda.synchronize() bracketing for accurate CUDA numbers")
     args = ap.parse_args()
 
     def from_root(p):
@@ -391,13 +352,11 @@ def main():
     out_video = PROJECT_ROOT / f"outputs/{today_pretty()} - phase3 anchored ar overlay [{args.tag}].mp4"
     out_npz = PROJECT_ROOT / f"outputs/{today_pretty()} - phase3 anchored fused [{args.tag}].npz"
 
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    print(f"device: {device}")
+    device = pick_device()
+    cfg = configure_perf(device)
+    print(f"device: {device}  yolo: {cfg['yolo_device']}  fp16: {cfg['fp16']}  "
+          f"workers: {cfg['num_workers']}  pin: {cfg['pin_memory']}  "
+          f"autocast: {cfg['autocast_dtype']}")
     print(f"left:   {clip_l.name}")
     print(f"right:  {clip_r.name}")
     print(f"calib:  {calib_path.name}")
@@ -446,19 +405,23 @@ def main():
 
     n_pairs = 0
     n_anchored = 0
+    io_time = 0.0
     inference_time = 0.0
     fusion_time = 0.0
     render_time = 0.0
     t0 = time.time()
     for i in range(n):
+        tio0 = time.time()
         ok_l, fl = cap_l.read()
         ok_r, fr = cap_r.read()
+        io_time += time.time() - tio0
         if not (ok_l and ok_r):
             break
 
         ti0 = time.time()
-        hands_l = detect_and_regress(detector, model, model_cfg, fl, device)
-        hands_r = detect_and_regress(detector, model, model_cfg, fr, device)
+        hands_l = detect_and_regress(detector, model, model_cfg, fl, device, cfg)
+        hands_r = detect_and_regress(detector, model, model_cfg, fr, device, cfg)
+        cuda_sync(device)
         inference_time += time.time() - ti0
 
         pairs = match_stereo_pairs(hands_l, hands_r, calib)
@@ -607,8 +570,21 @@ def main():
     if valid_kr.size:
         print(f"scale k right:            median {np.median(valid_kr):.3f}, "
               f"5-95 [{np.percentile(valid_kr,5):.3f}, {np.percentile(valid_kr,95):.3f}]")
-    print(f"inference: {inference_time:.1f}s   fusion: {fusion_time:.1f}s   "
-          f"render: {render_time:.1f}s   wall: {time.time()-t0:.1f}s")
+    wall = time.time() - t0
+    print(f"io: {io_time:.1f}s   inference: {inference_time:.1f}s   "
+          f"fusion: {fusion_time:.1f}s   render: {render_time:.1f}s   wall: {wall:.1f}s")
+    if args.bench:
+        # Per-frame breakdown so we can see where time goes on each device.
+        # cuda.synchronize() above bracketed inference, so on CUDA these
+        # numbers reflect actual GPU work, not just async kernel launches.
+        nf = max(n_pairs, 1)
+        print("--- bench (per processed frame, ms) ---")
+        print(f"  io:        {1000 * io_time / max(n, 1):7.2f}")
+        print(f"  inference: {1000 * inference_time / max(n, 1):7.2f}  "
+              f"({n} frames, both views per frame)")
+        print(f"  fusion:    {1000 * fusion_time / max(n_pairs, 1):7.2f}  per matched pair")
+        print(f"  render:    {1000 * render_time / max(n_anchored, 1):7.2f}  per anchored pair")
+        print(f"  end-to-end fps: {n / wall:5.2f}")
     print(f"video -> {out_video.name}")
     print(f"npz   -> {out_npz.name}")
 

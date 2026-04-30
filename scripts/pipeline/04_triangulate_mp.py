@@ -25,6 +25,7 @@ Outputs:
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import mediapipe as mp
@@ -32,6 +33,7 @@ import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_lib"))
 from dated import today_pretty
 
 

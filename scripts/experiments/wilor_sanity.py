@@ -29,101 +29,33 @@ If any of these stop being needed (upstream pinning a newer ultralytics,
 PyTorch reverting the default, etc.), the workaround can be deleted.
 """
 
-import os
 import sys
 import time
-import types
 from pathlib import Path
 
-# --- Workaround 1: pyrender on macOS ------------------------------------------
-# Stub the three renderer-using submodules of wilor.utils so model imports work.
-# Anything that actually tries to render will explode loudly - fine, this is
-# inference-only.
+# _lib bootstrap — must come BEFORE importing torch / wilor.* so wilor_setup's
+# pyrender stubs and torch.load patch take effect.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_lib"))
+import wilor_setup  # noqa: F401, E402  side-effects: stubs + torch.load patch + sys.path + chdir
+from wilor_setup import PROJECT_ROOT  # noqa: E402
 
+import torch                                                             # noqa: E402
+import cv2                                                               # noqa: E402
+import numpy as np                                                       # noqa: E402
+from ultralytics import YOLO                                             # noqa: E402
 
-class _NoopRenderer:
-    def __init__(self, *a, **kw):
-        pass
+from dated import today_pretty                                           # noqa: E402
+from device import pick_device, configure_perf, to_device_safe as to_device  # noqa: E402
 
-    def __getattr__(self, name):
-        raise RuntimeError(
-            f"sanity stubbed out the renderer; nothing should be calling "
-            f"{name!r} during inference"
-        )
+from wilor.models import load_wilor                                      # noqa: E402
+from wilor.datasets.vitdet_dataset import ViTDetDataset                  # noqa: E402
 
-
-def _cam_crop_to_full(*a, **kw):
-    raise RuntimeError("cam_crop_to_full stubbed out in sanity")
-
-
-for _mod_name, _attrs in [
-    ("wilor.utils.renderer",          {"Renderer": _NoopRenderer, "cam_crop_to_full": _cam_crop_to_full}),
-    ("wilor.utils.mesh_renderer",     {"MeshRenderer": _NoopRenderer}),
-    ("wilor.utils.skeleton_renderer", {"SkeletonRenderer": _NoopRenderer}),
-]:
-    _stub = types.ModuleType(_mod_name)
-    for _k, _v in _attrs.items():
-        setattr(_stub, _k, _v)
-    sys.modules[_mod_name] = _stub
-
-# --- Workaround 2: PyTorch 2.6 torch.load default -----------------------------
-import torch
-
-_orig_torch_load = torch.load
-
-
-def _patched_torch_load(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _orig_torch_load(*args, **kwargs)
-
-
-torch.load = _patched_torch_load
-
-import cv2
-import numpy as np
-from ultralytics import YOLO
-
-# --- Path setup
-# WiLoR's repo layout is unusual: cameramount/wilor/ is the repo root and
-# also contains a `models/` directory (where the user dropped MANO_RIGHT.pkl)
-# and a `wilor/` directory (the actual python package, no __init__.py). If
-# the parent dir (cameramount/) were on sys.path, Python would treat
-# cameramount/wilor/ as a namespace package and `wilor.models` would
-# ambiguously resolve to either the MANO drop or the real submodule.
-# Putting only WILOR_DIR on sys.path makes `import wilor.models` resolve
-# unambiguously to cameramount/wilor/wilor/models/.
-from dated import today_pretty   # scripts/dated.py — siblings on sys.path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WILOR_DIR = PROJECT_ROOT / "wilor"
 INPUT_IMG = PROJECT_ROOT / "inputs/24th April 2026 - photo cam0.jpg"
-
-if not WILOR_DIR.is_dir():
-    sys.exit(f"missing {WILOR_DIR}: did Phase 0 setup run? see PLAN.md")
 if not INPUT_IMG.is_file():
     sys.exit(f"missing {INPUT_IMG}: input photo not found")
 
 OUT_OVERLAY = PROJECT_ROOT / f"outputs/{today_pretty()} - wilor sanity overlay.jpg"
 OUT_OBJ = PROJECT_ROOT / f"outputs/{today_pretty()} - wilor sanity hand0.obj"
-
-sys.path.insert(0, str(WILOR_DIR))
-os.chdir(WILOR_DIR)
-
-from wilor.models import load_wilor                                   # noqa: E402
-from wilor.datasets.vitdet_dataset import ViTDetDataset                # noqa: E402
-
-
-def to_device(obj, device):
-    """recursive_to + float64 -> float32 cast (MPS doesn't support float64)."""
-    if torch.is_tensor(obj):
-        if obj.dtype == torch.float64:
-            obj = obj.to(torch.float32)
-        return obj.to(device)
-    if isinstance(obj, dict):
-        return {k: to_device(v, device) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return type(obj)(to_device(v, device) for v in obj)
-    return obj
 
 
 def save_obj(path: Path, vertices, faces):
@@ -135,13 +67,9 @@ def save_obj(path: Path, vertices, faces):
 
 
 def main():
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    print(f"device: {device}")
+    device = pick_device()
+    cfg = configure_perf(device)
+    print(f"device: {device}  yolo: {cfg['yolo_device']}")
 
     print("loading WiLoR ...")
     t0 = time.time()
@@ -163,7 +91,7 @@ def main():
     t0 = time.time()
     # ultralytics has a known MPS bug for Pose models, so YOLO runs on CPU
     # while WiLoR (the heavy ViT) runs on MPS. See ultralytics issue #4031.
-    detections = detector(img, device="cpu", conf=0.3, verbose=False)[0]
+    detections = detector(img, device=cfg["yolo_device"], conf=0.3, verbose=False)[0]
     bboxes, is_right = [], []
     for det in detections:
         bbox = det.boxes.data.cpu().detach().squeeze().numpy()

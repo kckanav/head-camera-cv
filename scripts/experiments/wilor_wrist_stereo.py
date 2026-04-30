@@ -21,68 +21,28 @@ Run:
 """
 
 import argparse
-import os
 import sys
 import time
-import types
 from pathlib import Path
 
+# _lib bootstrap — must come BEFORE importing torch / wilor.* so wilor_setup's
+# pyrender stubs and torch.load patch take effect.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_lib"))
+import wilor_setup  # noqa: F401, E402  side-effects: stubs + torch.load patch + sys.path + chdir
+from wilor_setup import PROJECT_ROOT                                     # noqa: E402
 
-# --- Workaround 1: pyrender on macOS ------------------------------------------
-class _NoopRenderer:
-    def __init__(self, *a, **kw):
-        pass
+import torch                                                             # noqa: E402
+import cv2                                                               # noqa: E402
+import numpy as np                                                       # noqa: E402
+from ultralytics import YOLO                                             # noqa: E402
 
-    def __getattr__(self, name):
-        raise RuntimeError(f"renderer stubbed; nothing should call {name!r}")
+from dated import today_pretty                                           # noqa: E402
+from device import pick_device, configure_perf, to_device_safe as to_device  # noqa: E402
 
+from wilor.models import load_wilor                                      # noqa: E402
+from wilor.datasets.vitdet_dataset import ViTDetDataset                  # noqa: E402
 
-def _cam_crop_to_full(*a, **kw):
-    raise RuntimeError("cam_crop_to_full stubbed")
-
-
-for _mod_name, _attrs in [
-    ("wilor.utils.renderer",          {"Renderer": _NoopRenderer, "cam_crop_to_full": _cam_crop_to_full}),
-    ("wilor.utils.mesh_renderer",     {"MeshRenderer": _NoopRenderer}),
-    ("wilor.utils.skeleton_renderer", {"SkeletonRenderer": _NoopRenderer}),
-]:
-    _stub = types.ModuleType(_mod_name)
-    for _k, _v in _attrs.items():
-        setattr(_stub, _k, _v)
-    sys.modules[_mod_name] = _stub
-
-# --- Workaround 2: PyTorch 2.6 weights_only default ---------------------------
-import torch
-
-_orig_torch_load = torch.load
-
-
-def _patched_torch_load(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _orig_torch_load(*args, **kwargs)
-
-
-torch.load = _patched_torch_load
-
-import cv2
-import numpy as np
-from ultralytics import YOLO
-
-# --- Path setup (same logic as wilor_sanity.py; see comments there) -----------
-from dated import today_pretty   # scripts/dated.py — siblings on sys.path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WILOR_DIR = PROJECT_ROOT / "wilor"
-DEFAULT_CALIB = PROJECT_ROOT / "outputs/27th April 2026 wide - stereo calibration.npz"
-
-if not WILOR_DIR.is_dir():
-    sys.exit("missing wilor/ - run Phase 0 (env + WiLoR clone) first; see PLAN.md")
-
-sys.path.insert(0, str(WILOR_DIR))
-os.chdir(WILOR_DIR)
-
-from wilor.models import load_wilor                                   # noqa: E402
-from wilor.datasets.vitdet_dataset import ViTDetDataset                # noqa: E402
+DEFAULT_CALIB = PROJECT_ROOT / "outputs/30th April 2026 wide - stereo calibration.npz"
 
 # --- Constants ----------------------------------------------------------------
 WRIST = 0       # MANO/MediaPipe landmark index for wrist
@@ -101,18 +61,6 @@ HAND_CONNECTIONS = [
 
 
 # --- Helpers ------------------------------------------------------------------
-def to_device(obj, device):
-    if torch.is_tensor(obj):
-        if obj.dtype == torch.float64:
-            obj = obj.to(torch.float32)
-        return obj.to(device)
-    if isinstance(obj, dict):
-        return {k: to_device(v, device) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return type(obj)(to_device(v, device) for v in obj)
-    return obj
-
-
 def load_calib(path):
     c = np.load(path)
     return {
@@ -130,9 +78,9 @@ def raw_to_rectified(pts_xy, K, dist, R, P):
     return out.reshape(-1, 2)
 
 
-def detect_and_regress(detector, model, img, device, batch_size=8):
-    """YOLO detect (CPU) -> WiLoR regress (device). Returns list of dicts."""
-    detections = detector(img, device="cpu", conf=0.3, verbose=False)[0]
+def detect_and_regress(detector, model, img, device, yolo_device, batch_size=8):
+    """YOLO detect (yolo_device) -> WiLoR regress (device). Returns list of dicts."""
+    detections = detector(img, device=yolo_device, conf=0.3, verbose=False)[0]
     if len(detections) == 0:
         return []
     bboxes, is_right = [], []
@@ -301,13 +249,10 @@ def main():
     out_video = PROJECT_ROOT / f"outputs/{today_pretty()} - wilor stereo demo {out_tag}.mp4"
     out_npz = PROJECT_ROOT / f"outputs/{today_pretty()} - wilor stereo demo {out_tag}.npz"
 
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    print(f"device: {device}   clip: {clip_l.name} / {clip_r.name}")
+    device = pick_device()
+    cfg = configure_perf(device)
+    print(f"device: {device}  yolo: {cfg['yolo_device']}   "
+          f"clip: {clip_l.name} / {clip_r.name}")
     print(f"calibration: {calib_path.name}")
 
     calib = load_calib(calib_path)
@@ -356,8 +301,8 @@ def main():
             break
 
         ti0 = time.time()
-        hands_l = detect_and_regress(detector, model, fl, device)
-        hands_r = detect_and_regress(detector, model, fr, device)
+        hands_l = detect_and_regress(detector, model, fl, device, cfg["yolo_device"])
+        hands_r = detect_and_regress(detector, model, fr, device, cfg["yolo_device"])
         inference_time += time.time() - ti0
 
         if hands_l and not hands_r: n_l_only += 1

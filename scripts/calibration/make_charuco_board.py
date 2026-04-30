@@ -13,11 +13,15 @@ Output is an A4-landscape PDF rendered at 600 DPI. Print at 100% scale (no
 to verify the print came out at true size.
 """
 
+import sys
+from pathlib import Path
+
 import cv2
 import cv2.aruco as aruco
 import numpy as np
 from PIL import Image
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_lib"))
 from dated import today_pretty
 
 SQUARES_X = 9

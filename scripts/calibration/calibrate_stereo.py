@@ -24,14 +24,16 @@ Three numbers to look at after running:
 
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import cv2.aruco as aruco
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_lib"))
 from dated import today_pretty
 
-# --- Board geometry (matches make_calibration_board.py, scaled to actual print) ---
+# --- Board geometry (matches make_charuco_board.py, scaled to actual print) ---
 SQUARES_X = 9
 SQUARES_Y = 6
 SQUARE_M = 0.02909  # measured edge of one printed square, in metres

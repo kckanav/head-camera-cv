@@ -15,13 +15,25 @@ methods are monocular and have to work around that — we won't have to.
 
 ## Hardware
 
-- 2× **Raspberry Pi Camera Module 3** mounted on a custom 3D-printed head
-  bracket, tilted downward toward the wearer's hands.
+- 2× **Raspberry Pi Camera Module 3** (IMX708 sensor, 12 MP) mounted on a
+  custom 3D-printed head bracket, tilted downward toward the wearer's hands.
 - **Designed 24° toe-out** between the cameras (12° per side off-centre).
   Stereo calibration **recovered 18.9°** — print tolerances on the bracket.
   All math now uses the calibrated value, not the design value.
 - **Recovered baseline**: 41.1 mm camera separation.
-- **Raspberry Pi 5** for capture; recording at 1280×720, 30 fps, H.264.
+- **Raspberry Pi 5** for capture. Two sensor modes are exposed by the
+  live-preview UI (`scripts/pi/dualstream.py`); both record at **1280×720
+  H.264 at a hard-locked 30 fps**:
+  - **2304×1296 binned full-FOV mode** — ~100° HFOV. **Current default**
+    for the wide-FOV captures used by the WiLoR pipeline. Sensor caps at
+    ~56 fps so 30 fps is comfortable.
+  - **1536×864 centre-cropped mode** — ~75° HFOV. Older default; still
+    used for the narrow-FOV reference clips and calibration.
+  The 4608×2592 full-resolution mode is also offered by the UI but caps
+  at ~14 fps so it can't sustain 30 fps recording — not used.
+- Switching sensor mode changes intrinsics, so a fresh calibration is
+  required after any switch. We keep both narrow-FOV (`""`) and wide-FOV
+  (`" wide"`) calibrations side-by-side in `outputs/`.
 - CAD source in `cad/dual_picam3_holder.scad`; v2 STL/3MF is the current revision.
 
 ## Pipeline plan (staged ladder)
@@ -39,11 +51,11 @@ the most when you do it next":
 | 5 | Object segmentation / tracking (SAM 2) | Know which pixels belong to the object | **Next** |
 | 6 | Grip event detection (heuristic first) | "Is the hand currently holding it?" | Not started |
 | 7 | Object 6-DoF pose | Orientation, not just position | Optional / later |
-| 8 | Dexterous hand capture (WiLoR + stereo) | Full MANO mesh + joint angles, robot-retargeting-ready | **In progress** — see [PLAN.md](PLAN.md) |
+| 8 | Dexterous hand capture (WiLoR + stereo) | Full MANO mesh + joint angles, robot-retargeting-ready | **In progress** — Phases 0-3 done, canonical pipeline at `scripts/pipeline/08_wilor_canonical.py`. Phase 4 (table-frame anchoring) and 5 (robot-training export) are next. See [PLAN.md](PLAN.md). |
 
 ## What we've achieved so far
 
-### Stitching pipeline (`process.py`)
+### Stitching pipeline (`scripts/viz/stitch_panorama.py`)
 
 Earlier the goal was to combine the two camera streams into one image. Started
 as a Colab snippet (Lowe-less SIFT, Colab-only display, wrong-direction
@@ -62,7 +74,7 @@ debug view, but for the real pipeline we want the two views *preserved*, not
 fused. This is what motivates the stereo-calibration step over a fancier
 stitcher.
 
-### Hand detection sanity check (`hands.py`)
+### Hand detection sanity check (`scripts/pipeline/01_per_cam_sanity.py`)
 
 Ran **MediaPipe HandLandmarker (Tasks API)** on a 15-second clip from each
 camera (`1:40 – 1:55` of the 4-minute test recording).
@@ -89,16 +101,16 @@ should work on the Pi 5 too.
   inter-finger occlusion (both hands gripping a tube of grease, fingers wrapped
   around) — keypoints stay locked at 0.94–0.99 confidence on both cameras.
 
-### Stereo calibration (`make_calibration_board.py`, `calibrate.py`)
+### Stereo calibration (`scripts/calibration/make_charuco_board.py`, `scripts/calibration/calibrate_stereo.py`)
 
 Stage 3 needed two pieces:
 
-**1. A calibration target.** `make_calibration_board.py` generates a 9×6
+**1. A calibration target.** `make_charuco_board.py` generates a 9×6
 ChArUco board PDF (30 mm squares, 22 mm 5×5 ArUco markers, A4 landscape @
 600 DPI) with a 100 mm scale bar in the margin to verify print scale with a
 ruler.
 
-**2. The calibration itself.** `calibrate.py` takes synchronised left/right
+**2. The calibration itself.** `calibrate_stereo.py` takes synchronised left/right
 videos of the board moved by hand in front of a tripod-mounted rig (~40 s of
 footage at 30 fps), then:
 
@@ -144,7 +156,7 @@ Single-digit-millimetre depth resolution at hand-interaction range — plenty
 for grip aperture, fingertip positions, and "is the hand touching the object"
 heuristics.
 
-### Sparse 3D hand triangulation (`triangulate.py`, `inspect_3d.py`)
+### Sparse 3D hand triangulation (`scripts/pipeline/04_triangulate_mp.py`, `scripts/viz/inspect_3d_mp.py`)
 
 Stage 4 puts everything together:
 
@@ -165,7 +177,7 @@ Stage 4 puts everything together:
 9. Write a side-by-side rectified video annotated with skeletons, wrist
    depth (cm), and pinch (thumb-index) aperture (mm).
 
-`inspect_3d.py` is a small companion that loads the npz and plots wrist
+`inspect_3d_mp.py` is a small companion that loads the npz and plots wrist
 depth and pinch over time, one curve per hand slot.
 
 Result on the first 60 s of the test recording (alpha=1 rectification):
@@ -192,41 +204,61 @@ landmark gives a large depth error. Visible as occasional pinch outliers
 > 150 mm in the trajectory plot. Per-landmark Z-clamping or short-window
 temporal smoothing would clean it up. Not blocking.
 
-### Stage 8 in progress — WiLoR + stereo dexterous hand pipeline (`wilor_sanity.py`, `wilor_stereo_demo.py`)
+### Stage 8 in progress — WiLoR + stereo dexterous hand pipeline (`scripts/pipeline/08_wilor_canonical.py`)
 
 The sparse 21-keypoint MediaPipe output is enough for *trajectories* but not
 for retargeting to arbitrary robot grippers. To capture data that can drive
 a parallel-jaw, 3-finger, or anthropomorphic robot hand from the same
-recording, we're moving to **WiLoR** ([CVPR 2025](https://github.com/rolpotamias/WiLoR)) —
+recording, we moved to **WiLoR** ([CVPR 2025](https://github.com/rolpotamias/WiLoR)) —
 an end-to-end ViT model that produces full **MANO** parameters (16 joint
 rotations + 778-vertex mesh) per hand. Stereo gives us an unusual
 advantage: WiLoR is monocular and has scale ambiguity, but our calibrated
-stereo can fix the scale precisely from triangulating wrist/palm landmarks.
+stereo can fix the scale precisely.
 
-Phase 0 (env, weights, MANO), Phase 1 (sanity), and a combined **Phase 2
-+ minimal Phase 3** (per-view WiLoR with stereo wrist triangulation) are
-done:
+Phases 0–3 are all done:
 
-- WiLoR runs on Apple MPS on this M2 host (with the YOLO detector on CPU
-  per a known ultralytics MPS bug).
-- Sanity check on `inputs/24th April 2026 - photo cam0.jpg`: hand detected,
-  handedness "right" correct, mesh extent ~16 cm, 2D keypoints overlay
-  cleanly on the actual hand.
-- Stereo demo on the 15-s grease-box clip (`inputs/25th April 2026 -
-  cam{0,1} clip 1m40-1m55.mp4`): 451 frames in 7.5 min wall time at
-  ~1 fps on warm MPS. Per-view WiLoR + per-frame wrist triangulation gives
-  metric wrist depth annotations (`z=XX.X cm`) on the side-by-side video.
-  Median wrist depth 34.1 cm, in line with what MediaPipe-stereo
-  reported on similar footage (regression baseline).
-- Discovered and fixed a left-hand keypoint mirroring bug along the way:
-  WiLoR's `ViTDetDataset` flips left-hand input crops, so the 2D keypoint
-  output is in flipped-crop coords — needs un-flipping before being mapped
-  back to the original image. Without the fix, left-hand skeletons render
-  at mirrored X positions and bias triangulated wrist X toward the bbox
-  centre.
-- Reproducible from a fresh session via `wilor_sanity.py` and
-  `wilor_stereo_demo.py`. Full plan, install gotchas, and the next phases
-  (full mesh scale fusion → dataset export) are in [`PLAN.md`](PLAN.md).
+- **Phase 0–1** (env + sanity): WiLoR runs on Apple MPS on this M2 host
+  (with the YOLO detector on CPU per ultralytics issue #4031). Sanity
+  check on a real Pi-Cam frame: hand detected, mesh extent ~16 cm, 2D
+  keypoints overlay cleanly on the actual hand.
+  Entry point: `scripts/experiments/wilor_sanity.py`.
+- **Phase 2** (per-view WiLoR + stereo wrist triangulation): metric wrist
+  depth annotations on a side-by-side video. Median wrist depth ~34 cm,
+  in line with what MediaPipe-stereo reported on similar footage
+  (regression baseline holds).
+  Entry point: `scripts/experiments/wilor_wrist_stereo.py`.
+- **Phase 3 (full Umeyama)** — *reference experiment*: triangulate all 21
+  keypoints, fit a 7-DOF similarity transform, project the same world-
+  frame mesh into both views. 99.3% fuse rate, but median 2D reprojection
+  error blew up to 10 px. **Worse than monocular WiLoR.** Kept for the
+  negative-result record.
+  Entry point: `scripts/experiments/wilor_phase3_umeyama.py`.
+- **Phase 3 (anchored)** — *canonical pipeline*: per view, `cv2.solvePnP`
+  fits 6-DOF pose to WiLoR's 2D keypoints; stereo wrist depth supplies
+  a 1-DOF metric scale anchor `k = Z_stereo / t_pnp[2]`. Uniform 3D
+  scaling preserves perspective 2D projection (`(X,Y,Z) → (fX/Z, fY/Z)`
+  is invariant under `(kX, kY, kZ)`), so the rendered overlay matches
+  the per-view monocular baseline (median PnP residual ~2 px) while
+  the underlying mesh is metric. The scale anchor uses stereo only for
+  the one thing it can give that monocular cannot.
+  Entry point: `scripts/pipeline/08_wilor_canonical.py`. Has full
+  CUDA/MPS device portability via `scripts/_lib/device.py` plus a
+  `--bench` flag for per-stage perf tracing.
+
+Discovered and fixed along the way:
+
+- **Left-hand keypoint mirroring**: WiLoR's `ViTDetDataset` flips left-hand
+  input crops, so `pred_keypoints_2d` and `pred_vertices` come out in
+  flipped-crop coords. Multiplying X by −1 before mapping back to image
+  coords fixes anatomically-flipped renders.
+- **Centralised WiLoR runtime workarounds** in `scripts/_lib/wilor_setup.py`:
+  pyrender stub (no EGL on macOS), `torch.load weights_only=False` patch
+  (PyTorch 2.6 broke YOLO ckpt loading), and the wilor sys.path / chdir
+  setup. Every wilor script now has a single `import wilor_setup` line
+  instead of 60+ lines of boilerplate.
+
+Full plan, install gotchas, and Phases 4–5 (visualisation + table-frame
+robot-training export) are in [`PLAN.md`](PLAN.md).
 
 ### Other known limitations
 
@@ -250,17 +282,30 @@ done:
 README.md / PLAN.md / CLAUDE.md   Docs (read CLAUDE.md before contributing).
 
 scripts/                          All pipeline entry points (run from repo root).
-  process.py                      Stitching pipeline (panorama video).
-  hands.py                        MediaPipe HandLandmarker sanity check (stage 1).
-  make_calibration_board.py       ChArUco PDF generator (stage 3 input).
-  calibrate.py                    Stereo calibration from board videos (stage 3).
-  triangulate.py                  Sparse 3D hand triangulation (stage 4).
-  inspect_3d.py                   Trajectory plot of triangulated hand data.
-  wilor_sanity.py                 WiLoR setup sanity check (stage 8 phase 1).
-  wilor_stereo_demo.py            WiLoR per view + stereo wrist triangulation
-                                  (stage 8 phase 2 + minimal 3).
-  dualstream.py                   Pi-side dual capture + live HTML preview.
-  dated.py                        today_pretty() helper for dated filenames.
+  _lib/                           Shared imports (sys.path-injected by each script).
+    dated.py                      today_pretty() helper.
+    device.py                     pick_device / configure_perf — CUDA/MPS/CPU portability.
+    wilor_setup.py                pyrender stubs, torch.load patch, wilor sys.path/chdir.
+  pi/
+    dualstream.py                 Pi-side dual capture + live HTML preview UI.
+  calibration/
+    make_charuco_board.py         ChArUco PDF generator (stereo calibration target).
+    make_aruco_marker.py          ArUco PDF generator (table-frame anchor for stage 8 phase 4-5).
+    calibrate_stereo.py           Stereo calibration from board videos (stage 3).
+  pipeline/                       The canonical pipeline, in run order.
+    01_per_cam_sanity.py          MediaPipe HandLandmarker per-camera sanity (stage 1).
+    04_triangulate_mp.py          Sparse 3D hand triangulation via MediaPipe + stereo (stage 4).
+    08_wilor_canonical.py         WiLoR + stereo metric depth (stage 8). --bench for perf trace.
+  viz/                            Visualisation + debug viewers.
+    play_stereo.py                SBS rectified playback with on-the-fly --alpha.
+    depth_dense.py                Dense stereo depth (overlay / turbo / both).
+    inspect_3d_mp.py              Trajectory plot of triangulated MediaPipe hand data.
+    stitch_panorama.py            Old SIFT/RANSAC panorama stitcher (debug-only).
+    wilor_ar_monocular.py         Per-view monocular AR overlay (visual baseline).
+  experiments/                    Reference scripts kept for the record.
+    wilor_sanity.py               Single-image WiLoR sanity check (stage 8 phase 1).
+    wilor_wrist_stereo.py         Per-view WiLoR + stereo wrist-only triangulation (phase 2).
+    wilor_phase3_umeyama.py       Phase 3 (full Umeyama) — superseded; kept as negative-result record.
 
 cad/                              Head-mount CAD (.scad source + .stl / .3mf exports).
 inputs/                           Tracked test material — filenames dated by capture.
@@ -274,7 +319,9 @@ wilor/                            (gitignored) Cloned WiLoR repo — large weigh
 ```
 
 Run scripts from the repo root so the relative paths in `inputs/` /
-`outputs/` / `models/` resolve correctly: `.venv/bin/python scripts/calibrate.py`.
+`outputs/` / `models/` resolve correctly:
+`.venv/bin/python scripts/calibration/calibrate_stereo.py` or
+`.venv-hamer/bin/python scripts/pipeline/08_wilor_canonical.py`.
 
 Filenames in `inputs/` and `outputs/` look like `27th April 2026 - stereo
 hands annotated.mp4`. Re-running a script on a new day produces a new
@@ -311,7 +358,7 @@ rectified frames.
 - `e63edb9` — hand detection on first minute of each camera
 - `e008189` — generate ChArUco calibration board sized for the Pi Cam 3 rig
 - `fa40c85` — stereo calibration (stage 3): script, capture footage, recovered geometry
-- `402af8c` — sparse 3D hand triangulation (stage 4): pipeline, results, trajectory plot
+- `402af8c` — sparse 3D hand triangulation (st	age 4): pipeline, results, trajectory plot
 - `19c7ecd` — README + CLAUDE.md update for stages 3 and 4
 - `9f17555` — stage 8 phase 0+1 (WiLoR setup + sanity)
 - `5254d62` — stage 8 phase 2 + minimal phase 3 (per-view WiLoR + stereo wrist triangulation, with left-hand mirror bug fix)

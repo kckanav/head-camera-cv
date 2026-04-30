@@ -13,37 +13,74 @@ Hardware + CV prototype for an egocentric hand-tracking rig:
 
 ## Repo layout (only the non-obvious bits)
 
-All entry points live in `scripts/`. Everything is run from the **repo root** so the relative `inputs/` / `outputs/` / `models/` paths inside the scripts resolve correctly.
+All entry points live under `scripts/`, segregated by role. Everything is run from the **repo root** so the relative `inputs/` / `outputs/` / `models/` paths resolve correctly.
 
-- `scripts/process.py` — stitching pipeline (panorama video). See architecture notes below.
-- `scripts/hands.py` — MediaPipe HandLandmarker sanity-check pipeline (stage 1).
-- `scripts/make_calibration_board.py` — generates the print-ready ChArUco board PDF used as the calibration target.
-- `scripts/calibrate.py` — stereo calibration from videos of the board (stage 3). Writes intrinsics, extrinsics, rectification maps, and `Q` to an `.npz`. Has a `TAG` constant near the top to keep narrow-FOV (`""`) and wide-FOV (`" wide"`) calibrations side-by-side in `outputs/`.
-- `scripts/triangulate.py` — sparse 3D hand triangulation (stage 4). Loads the calibration, rectifies both streams, runs MediaPipe per view, pairs hands by epipolar (rectified-row) proximity, triangulates 21 landmarks per matched hand. Writes an annotated SBS video and a per-frame `(N, 2, 21, 3)` landmarks `.npz`.
-- `scripts/inspect_3d.py` — quick matplotlib visualisation of the triangulated `.npz`: wrist depth + pinch aperture over time.
-- `scripts/wilor_sanity.py` — stage 8 / Phase 1 sanity check. Loads WiLoR + YOLO + MANO, runs them on `inputs/24th April 2026 - photo cam0.jpg`, writes a 2D-keypoint overlay (`outputs/<date> - wilor sanity overlay.jpg`) and the MANO mesh as `.obj`. The script lives in `scripts/` (not inside `wilor/`) so it survives a re-clone of the gitignored WiLoR repo. Has several inline workarounds documented in its docstring (pyrender stub, `torch.load` patch, MPS float64 cast, namespace-package fix via WILOR_DIR-only on sys.path). Run via `.venv-hamer/bin/python scripts/wilor_sanity.py`.
-- `scripts/wilor_stereo_demo.py` — stage 8 / Phase 2 + minimal Phase 3. Loads the stereo calibration `.npz`, runs WiLoR on each view's raw frames (MPS for ViT, CPU for YOLO), pairs hands across views by rectified-row proximity of the wrist, triangulates the wrist with `cv2.triangulatePoints(P1, P2, ...)` for metric depth, writes a side-by-side annotated video plus a per-frame `.npz`. Default calibration is the wide-FOV one; CLI args `--clip-left/--clip-right/--calib/--tag/--max-frames` override the presets, and a `from_root()` helper resolves user-supplied relative paths against the repo root (the script `chdir`s into `wilor/` for picamera2 config paths). Pass `--long` for the 60-s narrow clip preset. Only the **wrist** is triangulated here.
-- `scripts/wilor_ar_overlay.py` — per-view monocular AR overlay. Runs WiLoR per view, fits a weak-perspective affine (`pred_kp3d.xy` → `pred_kp2d`) per detected hand, applies it to all 778 vertices, rasterizes via painter's algorithm with Lambertian shading. Two independent meshes per frame; the stereo rig isn't doing any work on the mesh itself. Useful as the visual baseline that the Phase 3 experiments are compared against.
-- `scripts/wilor_phase3.py` — **Phase 3 (full Umeyama) reference experiment.** Triangulates all 21 keypoints per matched hand, fits a 7-DOF similarity transform (s, R, t) via weighted Umeyama 1991, projects the same world-frame mesh into both views via `R1.T` (undo rectification) + per-camera `K + dist`. The Umeyama refit gave one mesh in one frame but worse 2D accuracy than monocular WiLoR (median 10 px reproj error). Kept as a reference; not the canonical pipeline.
-- `scripts/wilor_phase3_anchored.py` — **canonical Phase 3.** Per detected hand, per view: `cv2.solvePnP(SQPNP)` fits (R, t) so the mesh in real camera frame projects to WiLoR's 2D keypoints, then a 1-DOF scalar `k = Z_stereo_wrist / t_pnp[2]` anchors the metric scale (uniform 3D scaling preserves perspective 2D, so the rendered overlay matches `wilor_ar_overlay.py`). Saves canonical world-frame metric mesh derived from the LEFT view, plus per-view PnP placement + scale + wrist 3D + PnP residuals for diagnostics.
-- `scripts/dualstream.py` — runs on the Pi 5. Discovers IMX708 sensor modes via `picamera2.sensor_modes`, exposes them as buttons in a live HTML preview UI, and locks capture to 30 fps via `FrameDurationLimits`. Default mode is 2304×1296 (full sensor, ~100° HFOV); the older 1536×864 cropped mode is ~75°. Lives on the Pi but is checked into the repo.
-- `scripts/dated.py` — tiny helper: `today_pretty()` returns a string like `27th April 2026`. All scripts import this so generated artifacts land in `outputs/` with human-readable dated filenames; re-running the same script on a new day produces a new file rather than overwriting.
+```
+scripts/
+├── _lib/             shared imports (sys.path-injected, not a package)
+├── pi/               runs on the Pi 5 only
+├── calibration/      one-shot setup utilities
+├── pipeline/         canonical pipeline, in run order (numbered)
+├── viz/              visualisation + debug viewers
+└── experiments/      historical / reference scripts (not on the canonical path)
+```
+
+### `scripts/_lib/` — shared imports
+
+Each script that needs these does `sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_lib"))` near the top, then imports from these modules by bare name (no package prefix).
+
+- `_lib/dated.py` — `today_pretty()` returns a string like `27th April 2026`. Every script that writes dated artefacts imports this.
+- `_lib/device.py` — **device portability layer.** `pick_device()` returns CUDA → MPS → CPU. `configure_perf(device)` returns a config dict (`yolo_device`, `fp16`, `num_workers`, `pin_memory`, `autocast_dtype`) that the wilor scripts plumb into ultralytics, ViTDetDataset, DataLoader, and `torch.autocast`. Same script behaves correctly on Mac (MPS+CPU YOLO, no fp16) and on a CUDA box (CUDA YOLO, fp16 ViT, TF32, pinned-memory dataloader). `to_device_safe(obj, device)` handles MPS's no-fp64 quirk and uses `non_blocking=True` only on CUDA. `autocast_ctx(device, dtype)` is a no-op on non-CUDA. `cuda_sync(device)` is a no-op on non-CUDA — wrap timing blocks with it for accurate CUDA numbers.
+- `_lib/wilor_setup.py` — **side-effect-on-import** module that sets up the WiLoR runtime: stubs three pyrender submodules (no EGL on macOS), patches `torch.load` to default `weights_only=False` (PyTorch 2.6 ckpt-loading break), inserts `<repo>/wilor` on `sys.path`, and `chdir`s into `wilor/` so WiLoR's relative `./pretrained_models/` paths resolve. Exports `PROJECT_ROOT`, `WILOR_DIR`, and `get_mano_faces(model)`. Every wilor script does `import wilor_setup` early — once, before any `import torch` / `from wilor.*`.
+
+### `scripts/pi/` — runs on the Pi 5
+
+- `pi/dualstream.py` — discovers IMX708 sensor modes via `picamera2.sensor_modes`, exposes them as buttons in a live HTML preview UI, locks capture to 30 fps via `FrameDurationLimits`. Default mode is 2304×1296 (full sensor, ~100° HFOV); the older 1536×864 cropped mode is ~75°. Lives on the Pi but is checked into the repo.
+
+### `scripts/calibration/` — one-shot setup
+
+- `calibration/make_charuco_board.py` — generates the print-ready ChArUco board PDF used as the stereo-calibration target.
+- `calibration/make_aruco_marker.py` — generates the print-ready ArUco marker PDF for table-frame anchoring (stage 8 phase 4–5). Default is one 80×80 mm `DICT_4X4_50` ID 0 with a 100 mm scale bar for print verification.
+- `calibration/calibrate_stereo.py` — stereo calibration from videos of the ChArUco board (stage 3). Writes intrinsics, extrinsics, rectification maps, and `Q` to an `.npz`. Has a `TAG` constant near the top to keep narrow-FOV (`""`) and wide-FOV (`" wide"`) calibrations side-by-side in `outputs/`.
+
+### `scripts/pipeline/` — canonical pipeline (numbered, run in order)
+
+- `pipeline/01_per_cam_sanity.py` — MediaPipe HandLandmarker sanity-check pipeline (stage 1).
+- `pipeline/04_triangulate_mp.py` — sparse 3D hand triangulation via MediaPipe + stereo (stage 4). Loads the calibration, rectifies both streams, runs MediaPipe per view, pairs hands by epipolar (rectified-row) proximity, triangulates 21 landmarks per matched hand. Writes an annotated SBS video and a per-frame `(N, 2, 21, 3)` landmarks `.npz`. **Kept as a fast preview path / regression baseline** for the wilor pipeline.
+- `pipeline/08_wilor_canonical.py` — **stage 8 canonical pipeline** (was `wilor_phase3_anchored.py`). Per detected hand, per view: `cv2.solvePnP(SQPNP)` fits (R, t) so the mesh in real camera frame projects to WiLoR's 2D keypoints, then a 1-DOF scalar `k = Z_stereo_wrist / t_pnp[2]` anchors the metric scale (uniform 3D scaling preserves perspective 2D, so the rendered overlay matches `viz/wilor_ar_monocular.py`). Saves canonical world-frame metric mesh derived from the LEFT view, plus per-view PnP placement + scale + wrist 3D + PnP residuals for diagnostics. **Has full CUDA/MPS device portability** via `_lib/device.py`, plus a `--bench` flag that prints per-stage timings (io / inference / fusion / render) with `cuda.synchronize()` bracketing for accurate CUDA numbers.
+
+### `scripts/viz/` — visualisation + debug
+
+- `viz/play_stereo.py` — side-by-side stereo player with on-the-fly rectification (recomputed at any `--alpha`, defaults to 0 for a clean rectilinear view rather than the saved `alpha=1` "two small spheres" look).
+- `viz/depth_dense.py` — dense stereo depth via SGBM. Three render styles: `overlay` (default — blue depth mask alpha-blended on the left frame, near = solid), `side` (turbo SBS), `both`.
+- `viz/inspect_3d_mp.py` — quick matplotlib visualisation of `04_triangulate_mp.py`'s `.npz`: wrist depth + pinch aperture over time.
+- `viz/stitch_panorama.py` — old SIFT/RANSAC panorama stitcher. Kept as a debug view; **not** on the canonical pipeline (stitching collapses parallax, which is exactly what we want to keep). See architecture notes below.
+- `viz/wilor_ar_monocular.py` — per-view monocular AR overlay (was `wilor_ar_overlay.py`). Runs WiLoR per view, fits a weak-perspective affine (`pred_kp3d.xy` → `pred_kp2d`), applies it to all 778 vertices, rasterises via painter's algorithm with Lambertian shading. Two independent meshes per frame; the stereo rig isn't doing any work on the mesh itself. **The visual baseline** that the canonical pipeline is compared against. Also has full CUDA/MPS device portability.
+
+### `scripts/experiments/` — kept for reference
+
+- `experiments/wilor_sanity.py` — stage 8 / Phase 1 sanity check. Loads WiLoR + YOLO + MANO, runs them on `inputs/24th April 2026 - photo cam0.jpg`, writes a 2D-keypoint overlay and the MANO mesh as `.obj`. Run via `.venv-hamer/bin/python scripts/experiments/wilor_sanity.py`.
+- `experiments/wilor_wrist_stereo.py` — stage 8 / Phase 2 (was `wilor_stereo_demo.py`). Per-view WiLoR + stereo *wrist-only* triangulation. Superseded by `pipeline/08_wilor_canonical.py` which does this and also fits the full mesh.
+- `experiments/wilor_phase3_umeyama.py` — Phase 3 (full Umeyama) reference experiment (was `wilor_phase3.py`). Fits a 7-DOF similarity transform via weighted Umeyama 1991. Gave one mesh in one frame but worse 2D accuracy than monocular WiLoR (median 10 px reproj). Kept for the negative-result record; the canonical pipeline uses the 1-DOF anchor instead.
+
+### Other dirs
+
 - `PLAN.md` — concrete plan for stage 8. Has a "pick-up-where-we-left-off" header at the top so a fresh session can resume. Update this whenever a phase finishes or a decision changes.
 - `cad/` — OpenSCAD source + `.stl` / `.3mf` exports of the head bracket.
 - `inputs/` — tracked test material (reference photos, short clips, calibration footage). Filenames are dated with the **capture** date.
-- `outputs/` — tracked generated artifacts. Filenames are dated with the **generation** date.
+- `outputs/` — tracked generated artefacts. Filenames are dated with the **generation** date.
 - `raw/` — **gitignored**. Local-only raw camera recordings (`cam{0,1}.mp4`, `cam{0,1}_*.h264`). Don't add tracked content here.
-- `models/` — **gitignored**. Re-downloadable model weights (currently just `hand_landmarker.task`). `hands.py` and `triangulate.py` reference it as `models/hand_landmarker.task`.
+- `models/` — **gitignored**. Re-downloadable model weights (currently just `hand_landmarker.task`). `01_per_cam_sanity.py` and `04_triangulate_mp.py` reference it as `models/hand_landmarker.task`.
 - `.venv/` — local Python 3.9 virtualenv used by stages 1–4. `opencv-python`, `numpy`, `mediapipe`, `matplotlib`, `Pillow` already installed. Use it directly; don't recreate.
-- `.venv-hamer/` — separate Python 3.10 virtualenv used by stage 8. Has `torch` (with MPS), the WiLoR package's deps, plus `dill` and `Cython` (not in WiLoR's `requirements.txt`; needed for the YOLO ckpt and `xtcocotools` build respectively). Don't recreate; if you do, follow the Phase 0 commands in `PLAN.md`.
-- `wilor/` — cloned WiLoR repo, **gitignored** (large weights, separate license). Contains `pretrained_models/{detector.pt, wilor_final.ckpt}` (downloaded from HuggingFace), `models/MANO_{RIGHT,LEFT}.pkl` (uploaded by the user under their MANO academic license), and `mano_data/MANO_{RIGHT,LEFT}.pkl` symlinked from the above (WiLoR's config expects them at `mano_data/`).
+- `.venv-hamer/` — separate Python 3.10 virtualenv used by stage 8. Has `torch` (with MPS on Mac, CUDA on Linux), the WiLoR package's deps, plus `dill` and `Cython` (not in WiLoR's `requirements.txt`; needed for the YOLO ckpt and `xtcocotools` build respectively). Don't recreate; if you do, follow the Phase 0 commands in `PLAN.md`.
+- `wilor/` — cloned WiLoR repo, **gitignored** (large weights, separate license). Contains `pretrained_models/{detector.pt, wilor_final.ckpt}`, `models/MANO_{RIGHT,LEFT}.pkl` (under user's MANO academic license), and `mano_data/MANO_{RIGHT,LEFT}.pkl` symlinked from the above (WiLoR's config expects them at `mano_data/`). Audited for hardcoded device strings — none found, the package is device-agnostic.
 
 ## Files NOT in git (too large, redownloadable, or license-restricted)
 
-- `raw/cam0.mp4`, `raw/cam1.mp4` — full 4-min recordings, ~144 MB each (over GitHub's 100 MB limit). `scripts/process.py` reads them from `raw/`. Switch the repo to git-lfs if you need to track them.
+- `raw/cam0.mp4`, `raw/cam1.mp4` — full 4-min recordings, ~144 MB each (over GitHub's 100 MB limit). `viz/stitch_panorama.py` reads them from `raw/`. Switch the repo to git-lfs if you need to track them.
 - `raw/*.h264` — raw streams from the Pi, same content as the mp4s. Mux to mp4 with `ffmpeg -framerate 30 -i <file>.h264 -c copy <file>.mp4` if you need a container with proper timing (raw h264 has no framerate metadata, so `ffprobe` defaults to 60).
-- `outputs/*stitched panorama.mp4` — the full stitched video is ~300 MB. We commit a sample frame instead; regenerate the video locally with `process.py`.
-- `outputs/*wilor stereo demo 60s*.mp4` — the 60-s WiLoR demo render is ~150 MB. The `.npz` and the `wilor 60s perf trace.png` are tracked; re-render the video locally if needed.
+- `outputs/*stitched panorama.mp4` — the full stitched video is ~300 MB. We commit a sample frame instead; regenerate locally with `viz/stitch_panorama.py`.
+- `outputs/*wilor stereo demo 60s*.mp4` — the 60-s WiLoR demo render is ~150 MB. The `.npz` and the `wilor 60s perf trace.png` are tracked; re-render locally if needed.
 - `models/hand_landmarker.task` — MediaPipe model, re-downloadable from Google's mediapipe-models bucket.
 
 ## Running things
@@ -51,24 +88,41 @@ All entry points live in `scripts/`. Everything is run from the **repo root** so
 All commands run from the **repo root**:
 
 ```bash
-.venv/bin/python scripts/process.py           # stitching pipeline (panorama)
-.venv/bin/python scripts/hands.py             # per-camera hand detection sanity check
-.venv/bin/python scripts/make_calibration_board.py   # regenerate the ChArUco PDF
-.venv/bin/python scripts/calibrate.py         # stereo calibration from board videos in inputs/
-.venv/bin/python scripts/triangulate.py       # sparse 3D hand triangulation; writes SBS video + .npz
-.venv/bin/python scripts/inspect_3d.py        # plot wrist depth + pinch over time from the .npz
-.venv-hamer/bin/python scripts/wilor_sanity.py             # stage 8 sanity check (uses the .venv-hamer Python)
-.venv-hamer/bin/python scripts/wilor_stereo_demo.py        # stage 8 stereo demo, defaults to 15-s grease clip + wide calib
-.venv-hamer/bin/python scripts/wilor_ar_overlay.py         # per-view monocular AR overlay (visual baseline)
-.venv-hamer/bin/python scripts/wilor_phase3.py             # Phase 3 (full Umeyama) reference experiment
-.venv-hamer/bin/python scripts/wilor_phase3_anchored.py    # canonical Phase 3: monocular pose + stereo depth
+# stage 1 / 3 / 4 (Python 3.9 venv)
+.venv/bin/python scripts/calibration/make_charuco_board.py    # regenerate the ChArUco PDF
+.venv/bin/python scripts/calibration/calibrate_stereo.py      # stereo calibration from inputs/<date> - cam{0,1} calibration.mp4
+.venv/bin/python scripts/calibration/make_aruco_marker.py     # ArUco marker for table anchoring (stage 8 phase 4-5)
+.venv/bin/python scripts/pipeline/01_per_cam_sanity.py        # per-camera MediaPipe sanity check
+.venv/bin/python scripts/pipeline/04_triangulate_mp.py        # sparse 3D hand triangulation; SBS video + .npz
+.venv/bin/python scripts/viz/inspect_3d_mp.py                 # plot wrist depth + pinch over time
+.venv/bin/python scripts/viz/play_stereo.py                   # SBS rectified playback (recomputes maps at --alpha)
+.venv/bin/python scripts/viz/depth_dense.py                   # dense stereo depth (--style overlay/side/both)
+.venv/bin/python scripts/viz/stitch_panorama.py               # debug-only panorama stitcher
+
+# stage 8 (Python 3.10 venv)
+.venv-hamer/bin/python scripts/pipeline/08_wilor_canonical.py            # canonical: PnP + stereo depth anchor
+.venv-hamer/bin/python scripts/pipeline/08_wilor_canonical.py --bench    # adds per-stage perf trace
+.venv-hamer/bin/python scripts/viz/wilor_ar_monocular.py                 # per-view monocular AR (visual baseline)
+.venv-hamer/bin/python scripts/experiments/wilor_sanity.py               # single-image sanity (Phase 1)
+.venv-hamer/bin/python scripts/experiments/wilor_wrist_stereo.py         # wrist-only stereo (Phase 2)
+.venv-hamer/bin/python scripts/experiments/wilor_phase3_umeyama.py       # Phase 3 (full Umeyama) reference experiment
 ```
 
-The wilor scripts and `triangulate.py`, `inspect_3d.py` all `subprocess.run(["open", ...])` their output on macOS so the result pops open after the run.
+The wilor scripts, `04_triangulate_mp.py`, and `inspect_3d_mp.py` all `subprocess.run(["open", ...])` their output on macOS so the result pops open after the run.
+
+### Device portability (CUDA / MPS / CPU)
+
+The canonical pipeline (`pipeline/08_wilor_canonical.py`) and the visual baseline (`viz/wilor_ar_monocular.py`) use the `_lib/device.py` helpers, so the *same script* runs efficiently on:
+
+- **macOS / Apple Silicon**: MPS for the WiLoR ViT, CPU for YOLO (ultralytics issue #4031 — Pose models break on MPS), no fp16, no autocast, no DataLoader workers.
+- **Linux + NVIDIA**: CUDA for both ViT and YOLO, fp16 input + fp16 autocast for the ViT (~1.7–2× throughput on Ampere+), TF32 fp32 matmul, `cudnn.benchmark=True`, multi-worker DataLoader with pinned memory for async H2D copy.
+- **CPU only**: fp32 throughout, no autocast, no workers — slow but functional.
+
+Verify on a CUDA box with `--bench` and a few frames; expect ~3–5× lower per-frame inference time than the unconfigured baseline (YOLO-on-GPU + fp16 ViT + TF32 stack).
 
 ## Pipeline architecture
 
-### `process.py` — stitching
+### `viz/stitch_panorama.py` — stitching
 
 Single linear script. Estimates **one** homography from a representative
 mid-clip frame and reuses it for every frame, since the cameras are rigidly
@@ -86,7 +140,7 @@ Things to keep in mind when modifying:
 - The cameras toe out ~19° (calibrated), so the overlap region between cam0 and cam1 is narrow and near the centerline. Match counts will be lower than for a typical panorama; tune the Lowe ratio / RANSAC threshold accordingly rather than assuming the matcher is broken.
 - Homography assumes a roughly planar scene or pure rotation. For close-up hands/objects (which is the actual use case), it's a known-imperfect model — expect parallax artefacts and don't treat ghosting as a code bug. **The real pipeline doesn't stitch — it triangulates.** Stitching is kept as a debug view.
 
-### `calibrate.py` — stereo calibration
+### `calibration/calibrate_stereo.py` — stereo calibration
 
 Reads `inputs/<date> - cam{0,1} calibration.mp4` (synchronised left/right videos of the ChArUco board moved by hand in front of a tripod-mounted rig). Per-camera intrinsics with `cv2.calibrateCamera`, then stereo extrinsics with `cv2.stereoCalibrate(..., CALIB_FIX_INTRINSIC)`, then `cv2.stereoRectify(..., alpha=1)`.
 
@@ -94,7 +148,7 @@ Reads `inputs/<date> - cam{0,1} calibration.mp4` (synchronised left/right videos
 
 Outputs everything (K_l/K_r, dist_l/dist_r, R, T, E, F, R1/R2, P1/P2, Q, remap tables, plus the rms numbers and recovered angle/baseline) to `outputs/<date> - stereo calibration.npz`. Renders a side-by-side rectified sample with green scanlines as a visual check — corresponding points must lie on the same scanline.
 
-### `triangulate.py` — sparse 3D hand keypoints
+### `pipeline/04_triangulate_mp.py` — sparse 3D hand keypoints
 
 Per frame pair:
 
@@ -109,40 +163,26 @@ Per frame pair:
 
 Known residual: per-fingertip Z is noisier than the wrist; a 1-pixel disparity error on a fingertip gives a large depth error. The wrist Z is solid; pinch aperture has occasional outliers > 150 mm. Per-landmark Z-clamping or short temporal smoothing would clean it up.
 
-### `wilor_sanity.py` — stage 8 phase 1 sanity check
+### `_lib/wilor_setup.py` — WiLoR runtime workarounds (centralised)
 
-Uses the `.venv-hamer` Python 3.10 venv. Loads YOLO + WiLoR + MANO from
-the gitignored `wilor/` directory, runs them on a real Pi-Cam frame, and
-writes an OpenCV overlay + `.obj` mesh. Several inline workarounds are
-documented in the script's docstring — they target this exact combination
-of WiLoR @ rolpotamias/main + ultralytics 8.1.34 + torch 2.11 on macOS:
+Every wilor script (`pipeline/08_wilor_canonical.py`, `viz/wilor_ar_monocular.py`, all of `experiments/wilor_*.py`) does `import wilor_setup` near the top, *before* any `import torch` or `from wilor.*`. That single import applies all the runtime workarounds we need on this stack (WiLoR @ rolpotamias/main + ultralytics 8.1.34 + torch 2.11 on macOS):
 
-- Stub three pyrender-using submodules of `wilor.utils` (no EGL on macOS).
-- Monkey-patch `torch.load` default to `weights_only=False` (PyTorch 2.6
-  flipped this; YOLO ckpt has pickled class refs).
-- Run YOLO on CPU (ultralytics MPS bug for Pose models, issue #4031).
-- Cast `float64` tensors to `float32` before `.to('mps')` (MPS doesn't
-  support `float64`).
-- Add only `wilor/` to `sys.path` (not the repo root) so Python doesn't
-  treat `cameramount/wilor/` as a namespace package — that would merge
-  the user's MANO uploads at `cameramount/wilor/models/` with the real
-  package's `cameramount/wilor/wilor/models/` and `import wilor.models`
-  would resolve ambiguously. Now that scripts live under `scripts/`, the
-  repo root is no longer implicitly on sys.path, so this just means
-  inserting `WILOR_DIR` directly.
-- For left-hand detections, multiply the X coord of `pred_keypoints_2d` and
-  `pred_vertices` by `-1` before mapping back to image coords or saving the
-  mesh. WiLoR's `ViTDetDataset` flips left-hand input crops, so the network
-  output is in flipped-crop space — without un-flipping, the rendered
-  skeleton is mirrored inside the bbox (looks roughly hand-shaped, but
-  thumb/pinky are swapped, and the wrist X is biased toward the bbox
-  centre).
+- Stubs the three pyrender-using submodules of `wilor.utils` (no EGL on macOS by default).
+- Monkey-patches `torch.load` default to `weights_only=False` (PyTorch 2.6 flipped this; the YOLO ckpt has pickled class refs).
+- Inserts `<repo>/wilor` on `sys.path` and `chdir`s into it so WiLoR's relative `./pretrained_models/` paths resolve.
 
-If any of these stop being needed (upstream pinning newer ultralytics, etc.),
-delete the corresponding workaround in `wilor_sanity.py`, `wilor_stereo_demo.py`,
-`wilor_ar_overlay.py`, `wilor_phase3.py`, `wilor_phase3_anchored.py` *and* this note.
+Two further workarounds are *device-conditional*, applied via `_lib/device.py`:
 
-### `wilor_phase3_anchored.py` — canonical Phase 3 (monocular pose + stereo depth)
+- YOLO on CPU only when `device.type == "mps"` (ultralytics issue #4031). On CUDA the detector runs on GPU as normal.
+- `float64 → float32` cast before `.to(device)` only when `device.type == "mps"` (MPS doesn't support fp64). On CUDA / CPU we leave dtypes alone.
+
+The last one is *per-script*, not centralised:
+
+- For left-hand detections, multiply the X coord of `pred_keypoints_2d`, `pred_vertices`, and `pred_keypoints_3d` by `-1` before mapping back to image coords or saving the mesh. WiLoR's `ViTDetDataset` flips left-hand input crops, so the network output is in flipped-crop space — without un-flipping, the rendered skeleton is mirrored inside the bbox (looks roughly hand-shaped, but thumb/pinky are swapped, and the wrist X is biased toward the bbox centre).
+
+If any of these stop being needed (upstream pinning newer ultralytics, PyTorch reverting `weights_only`, EGL on macOS), delete the corresponding step in `_lib/wilor_setup.py` (or `_lib/device.py`) *and* this note.
+
+### `pipeline/08_wilor_canonical.py` — canonical Phase 3 (monocular pose + stereo depth)
 
 The cleanest way to combine WiLoR's monocular strength with our stereo
 metric depth. Per matched-hand pair per frame:
@@ -160,8 +200,8 @@ metric depth. Per matched-hand pair per frame:
 
 **Math justification.** Uniform 3D scaling preserves perspective 2D
 projection, so the rendered overlay matches the per-view monocular
-output (`wilor_ar_overlay.py`) with PnP residuals of ~2 px median. The
-1-DOF anchor uses stereo only for the one thing it can give that
+output (`viz/wilor_ar_monocular.py`) with PnP residuals of ~2 px median.
+The 1-DOF anchor uses stereo only for the one thing it can give that
 monocular cannot: absolute scale.
 
 **Saved canonical 3D**: `verts_3d_world` is the LEFT view's metric mesh

@@ -7,10 +7,12 @@ trajectories or are jittery / dropping in/out.
 """
 
 import sys
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "_lib"))
 from dated import today_pretty
 
 NPZ_PATH = f"outputs/{today_pretty()} - stereo hand 3d.npz"
