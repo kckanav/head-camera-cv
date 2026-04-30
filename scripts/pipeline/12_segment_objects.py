@@ -140,17 +140,31 @@ def propagate_view(predictor, frames_dir: Path, clicks_xy: list[list[float]],
             labels=np.array([1], dtype=np.int32),   # 1 = positive click
         )
 
+    # SAM2's official setup recommends bf16 autocast (their README
+    # `notebooks/video_predictor_example.ipynb`); bf16 has the same
+    # range as fp32 so SAM2's transformer stays stable, and is generally
+    # faster than fp16 on Ampere+ GPUs. We keep _lib/device.py's fp16
+    # autocast for WiLoR (where fp16 is fine) but override here.
+    sam2_autocast = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                     if device.type == "cuda" else autocast_ctx(device, perf["autocast_dtype"]))
+
     cuda_sync(device)
     t0 = time.time()
-    with torch.inference_mode(), autocast_ctx(device, perf["autocast_dtype"]):
+    with torch.inference_mode(), sam2_autocast:
         for frame_idx, obj_ids, logits in predictor.propagate_in_video(state):
             for k, oid in enumerate(obj_ids):
                 masks[frame_idx, oid] = (logits[k] > 0.0).squeeze(0).cpu().numpy()
     cuda_sync(device)
     elapsed = time.time() - t0
 
-    print(f"    {n_frames} frames × {K} objects in {elapsed:.1f}s "
-          f"({n_frames / max(elapsed, 1e-6):.1f} fps)")
+    if device.type == "cuda":
+        gpu_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        print(f"    {n_frames} frames × {K} objects in {elapsed:.1f}s "
+              f"({n_frames / max(elapsed, 1e-6):.1f} fps)  "
+              f"peak GPU mem: {gpu_mem_mb:.0f} MiB")
+    else:
+        print(f"    {n_frames} frames × {K} objects in {elapsed:.1f}s "
+              f"({n_frames / max(elapsed, 1e-6):.1f} fps)")
 
     # Free per-video GPU buffers before the next view.
     predictor.reset_state(state)
@@ -319,8 +333,15 @@ def main() -> None:
     # ---- Device + SAM2 ----
     device = pick_device()
     perf = configure_perf(device)
-    print(f"device: {device}  fp16={perf['fp16']}  "
-          f"autocast={perf['autocast_dtype']}")
+    if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        cap = torch.cuda.get_device_capability(0)
+        print(f"device: cuda  ({gpu_name}, {gpu_mem_gb:.1f} GiB, sm_{cap[0]}{cap[1]})  "
+              f"autocast=bfloat16  TF32=on  cudnn.benchmark=on")
+    else:
+        print(f"device: {device}  fp16={perf['fp16']}  "
+              f"autocast={perf['autocast_dtype']}")
 
     ckpt = assert_checkpoint(Path(args.checkpoint))
 
