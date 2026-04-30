@@ -1,19 +1,31 @@
 """Stage 9 / Phase 1: interactive click UI to mark trackable objects in
 frame 0 of a stereo pair. Drives the SAM2 video segmenter downstream.
 
-You click each object once in the LEFT rectified view, type its label in
-the terminal, and the script auto-recovers the matching click in the
-RIGHT view by template-matching along the rectified epipolar row (so you
-get one click per object, not two).
+You click each object once in the LEFT view, type its label in the
+terminal, and the script auto-recovers the matching click in the RIGHT
+view by template-matching along the rectified epipolar row (so you get
+one click per object, not two).
 
-The output JSON lists per-object {label, left_xy, right_xy} for frame 0;
-`12_segment_objects.py` reads it as the seed prompts for SAM2's video
-predictor on each view independently.
+By default the script displays the **raw** (un-rectified) frames for
+clicking — the saved alpha=1 stereo rectification produces a curved
+"two small spheres" valid region surrounded by black, which is awkward
+to click on with wide-FOV cameras (~100° HFOV here). Internally we
+still undistort each click into rectified-image coordinates and run NCC
+on rectified frames, so the saved JSON is always in rectified coords —
+exactly what `12_segment_objects.py` feeds to SAM2 alongside rectified
+frames.
+
+Pass `--display rect` to see the rectified view directly (useful only
+if you ever switch to alpha=0 calibration).
+
+The output JSON lists per-object {label, left_xy, right_xy} for frame 0,
+all in rectified-image pixels.
 
 Run on the Mac side (CPU only; the heavy GPU pass comes later):
 
     .venv/bin/python scripts/pipeline/11_click_objects.py
     .venv/bin/python scripts/pipeline/11_click_objects.py --frame 30
+    .venv/bin/python scripts/pipeline/11_click_objects.py --display rect
     .venv/bin/python scripts/pipeline/11_click_objects.py \\
         --cam0 inputs/...mp4 --cam1 inputs/...mp4 \\
         --calib outputs/...npz --tag "27th April interaction"
@@ -25,6 +37,7 @@ Output:
       "right_video": "...",
       "calib":       "...",
       "frame":       0,
+      "coord_space": "rectified",
       "objects": [
         {"label": "cup",   "left_xy": [x, y], "right_xy": [x, y]},
         {"label": "plate", "left_xy": [x, y], "right_xy": [x, y]},
@@ -87,6 +100,43 @@ def rectify(frame: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.ndarr
     return cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR)
 
 
+def raw_to_rect_point(raw_xy: tuple[float, float],
+                      K: np.ndarray, dist: np.ndarray,
+                      R: np.ndarray, P: np.ndarray) -> tuple[float, float]:
+    """Convert a raw-image pixel to rectified-image pixel coords.
+
+    `K`, `dist` are the original camera intrinsics + distortion (cv2
+    convention). `R` is the rectifying rotation (R1 for left, R2 for
+    right). `P` is the projection matrix from stereoRectify. Output
+    matches what `cv2.remap` produces with the corresponding map.
+    """
+    pts = np.array([[list(raw_xy)]], dtype=np.float32)
+    out = cv2.undistortPoints(pts, K, dist, R=R, P=P)
+    x, y = float(out[0, 0, 0]), float(out[0, 0, 1])
+    return (x, y)
+
+
+def rect_to_raw_point(rect_xy: tuple[float, float],
+                      K: np.ndarray, dist: np.ndarray,
+                      R: np.ndarray, P: np.ndarray) -> tuple[float, float]:
+    """Inverse of `raw_to_rect_point`. Used only to draw the auto-matched
+    right-view click on the displayed RAW right frame."""
+    fx, fy = P[0, 0], P[1, 1]
+    cx, cy = P[0, 2], P[1, 2]
+    # Rectified normalized coord
+    xn = (rect_xy[0] - cx) / fx
+    yn = (rect_xy[1] - cy) / fy
+    # Direction in rectified frame; rotate back to camera frame (R rotates
+    # camera into rectified, so transpose un-rotates).
+    d_cam = R.T @ np.array([xn, yn, 1.0])
+    d_cam = d_cam / d_cam[2]
+    pts3d = d_cam.reshape(1, 1, 3).astype(np.float64)
+    raw, _ = cv2.projectPoints(pts3d,
+                               rvec=np.zeros(3), tvec=np.zeros(3),
+                               cameraMatrix=K, distCoeffs=dist)
+    return (float(raw[0, 0, 0]), float(raw[0, 0, 1]))
+
+
 def match_right_click(left_xy: tuple[float, float],
                       left_gray: np.ndarray,
                       right_gray: np.ndarray,
@@ -96,6 +146,9 @@ def match_right_click(left_xy: tuple[float, float],
     """Find the right-view click for a left-view click, by NCC template
     matching along the rectified epipolar row (±search_rows of slack to
     absorb residual rectification error).
+
+    Both `left_gray` and `right_gray` MUST be in rectified-image space;
+    the epipolar = same scanline assumption only holds after rectification.
 
     Returns None if the click is too close to the image edge for a full
     template patch.
@@ -135,6 +188,11 @@ def main() -> None:
                     help="stereo calibration .npz")
     ap.add_argument("--frame", type=int, default=0,
                     help="frame index used as click reference (default 0)")
+    ap.add_argument("--display", choices=("raw", "rect"), default="raw",
+                    help="show raw (un-rectified) frames or rectified frames "
+                         "for clicking. Default 'raw' avoids the alpha=1 "
+                         "two-spheres warp on wide cameras; click coords are "
+                         "still saved in rectified space either way.")
     ap.add_argument("--tag", default=DEFAULT_TAG,
                     help="output filename tag")
     ap.add_argument("--out", default=None,
@@ -157,28 +215,52 @@ def main() -> None:
     print(f"right (cam0): {cam0_path.name}")
     print(f"calib:        {calib_path.name}")
     print(f"frame:        {args.frame}")
+    print(f"display:      {args.display}  (clicks always saved in rectified coords)")
     print(f"output:       {out_path.relative_to(PROJECT_ROOT) if out_path.is_relative_to(PROJECT_ROOT) else out_path}")
     print()
 
     calib = np.load(calib_path, allow_pickle=True)
-    rect_left = rectify(grab_frame(cam1_path, args.frame),
-                        calib["map_left_x"], calib["map_left_y"])
-    rect_right = rectify(grab_frame(cam0_path, args.frame),
-                         calib["map_right_x"], calib["map_right_y"])
+    K_left = calib["K_left"]
+    K_right = calib["K_right"]
+    dist_left = calib["dist_left"]
+    dist_right = calib["dist_right"]
+    R1 = calib["R1"]
+    R2 = calib["R2"]
+    P1 = calib["P1"]
+    P2 = calib["P2"]
+    map_left_x = calib["map_left_x"]
+    map_left_y = calib["map_left_y"]
+    map_right_x = calib["map_right_x"]
+    map_right_y = calib["map_right_y"]
 
-    rect_left_rgb = cv2.cvtColor(rect_left, cv2.COLOR_BGR2RGB)
-    rect_right_rgb = cv2.cvtColor(rect_right, cv2.COLOR_BGR2RGB)
+    raw_left = grab_frame(cam1_path, args.frame)
+    raw_right = grab_frame(cam0_path, args.frame)
+
+    # Always compute rectified frames — needed for NCC matching even when
+    # display=raw.
+    rect_left = rectify(raw_left, map_left_x, map_left_y)
+    rect_right = rectify(raw_right, map_right_x, map_right_y)
     rect_left_gray = cv2.cvtColor(rect_left, cv2.COLOR_BGR2GRAY)
     rect_right_gray = cv2.cvtColor(rect_right, cv2.COLOR_BGR2GRAY)
+
+    if args.display == "raw":
+        disp_left = cv2.cvtColor(raw_left, cv2.COLOR_BGR2RGB)
+        disp_right = cv2.cvtColor(raw_right, cv2.COLOR_BGR2RGB)
+        title_l = f"LEFT (raw, frame {args.frame}) — click each object"
+        title_r = "RIGHT (raw) — auto-matched marker"
+    else:
+        disp_left = cv2.cvtColor(rect_left, cv2.COLOR_BGR2RGB)
+        disp_right = cv2.cvtColor(rect_right, cv2.COLOR_BGR2RGB)
+        title_l = f"LEFT (rectified, frame {args.frame}) — click each object"
+        title_r = "RIGHT (rectified) — auto-matched via epipolar NCC"
 
     objects: list[dict] = []
 
     fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-    axes[0].imshow(rect_left_rgb)
-    axes[0].set_title(f"LEFT (rectified, frame {args.frame})\n"
-                      "click on each object — type its label in the terminal")
-    axes[1].imshow(rect_right_rgb)
-    axes[1].set_title("RIGHT (rectified) — auto-matched via epipolar NCC")
+    axes[0].imshow(disp_left)
+    axes[0].set_title(title_l + "\ntype label in terminal after each click")
+    axes[1].imshow(disp_right)
+    axes[1].set_title(title_r)
     for ax in axes:
         ax.set_xticks([])
         ax.set_yticks([])
@@ -196,19 +278,43 @@ def main() -> None:
             return
         state["awaiting"] = False
 
-        x, y = float(event.xdata), float(event.ydata)
-        right = match_right_click((x, y), rect_left_gray, rect_right_gray)
-        if right is None:
+        # Convert the click to rectified-left coords; that's what we
+        # store and what NCC matching operates on. If display is already
+        # rectified, this is a no-op (round-trip).
+        click_disp = (float(event.xdata), float(event.ydata))
+        if args.display == "raw":
+            click_rect_l = raw_to_rect_point(click_disp, K_left, dist_left, R1, P1)
+        else:
+            click_rect_l = click_disp
+
+        # Bail if the rectified click landed outside the rectified image.
+        h_rect, w_rect = rect_left_gray.shape
+        if not (0 <= click_rect_l[0] < w_rect and 0 <= click_rect_l[1] < h_rect):
+            print(f"  (click maps outside the rectified image — try inside the valid region)")
+            state["awaiting"] = True
+            return
+
+        click_rect_r = match_right_click(click_rect_l, rect_left_gray, rect_right_gray)
+        if click_rect_r is None:
             print("  (click too close to image edge — try again)")
             state["awaiting"] = True
             return
 
+        # Marker positions in DISPLAY coords (raw or rect to match the imshow).
+        if args.display == "raw":
+            mark_l = click_disp                     # already in raw coords
+            mark_r = rect_to_raw_point(click_rect_r, K_right, dist_right, R2, P2)
+        else:
+            mark_l = click_rect_l
+            mark_r = click_rect_r
+
         n = len(objects)
         color = plt.cm.tab10(n % 10)
-        axes[0].plot(x, y, "+", color=color, markersize=20, mew=2.5)
-        axes[0].text(x + 8, y - 8, str(n), color=color, fontsize=12, weight="bold")
-        axes[1].plot(*right, "x", color=color, markersize=16, mew=2.5)
-        axes[1].text(right[0] + 8, right[1] - 8, str(n),
+        axes[0].plot(*mark_l, "+", color=color, markersize=20, mew=2.5)
+        axes[0].text(mark_l[0] + 8, mark_l[1] - 8, str(n),
+                     color=color, fontsize=12, weight="bold")
+        axes[1].plot(*mark_r, "x", color=color, markersize=16, mew=2.5)
+        axes[1].text(mark_r[0] + 8, mark_r[1] - 8, str(n),
                      color=color, fontsize=12, weight="bold")
         fig.canvas.draw_idle()
         plt.pause(0.05)   # flush draws before blocking on input()
@@ -219,7 +325,6 @@ def main() -> None:
             label = ""
         if not label:
             print("  (discarded)")
-            # Strip the markers we just drew so the discard is visible.
             for ax in axes:
                 if ax.lines:
                     ax.lines[-1].remove()
@@ -231,11 +336,13 @@ def main() -> None:
 
         objects.append({
             "label": label,
-            "left_xy":  [x, y],
-            "right_xy": list(right),
+            "left_xy":  list(click_rect_l),    # always rectified
+            "right_xy": list(click_rect_r),    # always rectified
         })
         state["awaiting"] = True
-        print(f"  saved '{label}' — click another, or close the window when done.")
+        print(f"  saved '{label}' at rect L=({click_rect_l[0]:.1f},{click_rect_l[1]:.1f}) "
+              f"R=({click_rect_r[0]:.1f},{click_rect_r[1]:.1f}) "
+              "— click another, or close the window when done.")
 
     fig.canvas.mpl_connect("button_press_event", on_click)
 
@@ -254,6 +361,7 @@ def main() -> None:
         "calib":       str(calib_path.relative_to(PROJECT_ROOT)
                            if calib_path.is_relative_to(PROJECT_ROOT) else calib_path),
         "frame":       int(args.frame),
+        "coord_space": "rectified",
         "objects":     objects,
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
