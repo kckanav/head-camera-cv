@@ -151,31 +151,54 @@ def predict_left_from_right(R_pnp_r, t_pnp_r, R_stereo, T_stereo):
     return R_l_pred, t_l_pred
 
 
+def normal_toward_camera_alignment(R, t):
+    """Cosine of the angle between the marker's +Z axis (its normal) and the
+    marker→camera direction, both expressed in the camera's own frame.
+
+    For a flat-on-table marker viewed from the camera, the printed face is
+    toward the camera so the normal points back at the camera — alignment
+    close to +1. The "ambiguous" IPPE_SQUARE solution flips the marker
+    around the camera→marker line, tilting the normal away from the camera
+    and giving a noticeably smaller alignment.
+    """
+    if np.linalg.norm(t) < 1e-9:
+        return 0.0
+    marker_to_camera = -t / np.linalg.norm(t)   # in camera frame
+    return float(R[:, 2] @ marker_to_camera)
+
+
 def pick_consistent_pair(sols_l, sols_r, R_stereo, T_stereo, marker_mm=80.0):
-    """Given two PnP solution lists (one per view) and the stereo extrinsic,
-    pick the (left_sol, right_sol) combination most cross-view-consistent.
+    """Pick the (left_sol, right_sol) combination from the IPPE_SQUARE
+    solutions that minimises a combined score:
 
-    For IPPE_SQUARE the two solutions per view differ mostly in rotation
-    (the marker centre is identical). Picking by translation residual alone
-    leaves the rotation ambiguity unresolved — corner displacements of a
-    rotation tilt are second-order and small in pixels. We combine both:
+      cross_view_residual (mm)
+        + (marker_mm/2) · sin(rotation_residual_rad)
+        + a per-view prior penalising solutions whose marker normal
+          points away from the camera
 
-        score = t_residual_mm + (marker_mm/2) * sin(r_residual_rad)
-
-    The (marker_mm/2)·sin(θ) term is the in-plane corner displacement
-    that a tilt of θ around the marker centre would produce, in mm. So
-    translation and rotation are weighed in commensurate millimetres.
+    The per-view prior is essential: IPPE_SQUARE returns two valid
+    solutions per view that are mirror-flipped about the camera→marker
+    line. Both views can pick the same wrong-flip, giving zero cross-view
+    residual on a non-physical pose where the marker plane is tilted
+    away from the camera. Penalising solutions with marker normal not
+    pointing toward the camera breaks that degeneracy.
 
     Returns (R_l, t_l, R_r, t_r, t_residual_mm, r_residual_deg).
     """
     best = (None, None, None, None, float("inf"), float("inf"), float("inf"))
     half = marker_mm / 2.0
     for R_l, t_l, _ in sols_l:
+        align_l = normal_toward_camera_alignment(R_l, t_l)
         for R_r, t_r, _ in sols_r:
+            align_r = normal_toward_camera_alignment(R_r, t_r)
             R_l_pred, t_l_pred = predict_left_from_right(R_r, t_r, R_stereo, T_stereo)
             t_res_mm = float(np.linalg.norm(t_l_pred - t_l)) * 1000.0
             r_res_deg = rot_angle_between(R_l, R_l_pred)
-            score = t_res_mm + half * abs(np.sin(np.radians(r_res_deg)))
+            cross_view = t_res_mm + half * abs(np.sin(np.radians(r_res_deg)))
+            # 100 mm/unit weight: a 0.5 alignment drop costs ~50 mm in the
+            # combined score, dominating any plausible cross-view residual.
+            alignment_penalty = 100.0 * (2.0 - align_l - align_r)
+            score = cross_view + alignment_penalty
             if score < best[4]:
                 best = (R_l, t_l, R_r, t_r, score, t_res_mm, r_res_deg)
     return best[0], best[1], best[2], best[3], best[5], best[6]
