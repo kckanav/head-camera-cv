@@ -1,0 +1,20 @@
+{
+  "left_video": "inputs/27th April 2026 wide - cam1 interaction first 10s.mp4",
+  "right_video": "inputs/27th April 2026 wide - cam0 interaction first 10s.mp4",
+  "calib": "outputs/30th April 2026 wide - stereo calibration.npz",
+  "frame": 0,
+  "coord_space": "rectified",
+  "objects": [
+    {
+      "label": "Phone",
+      "left_xy": [
+        755.4024047851562,
+        347.632568359375
+      ],
+      "right_xy": [
+        757.0,
+        348.0
+      ]
+    }
+  ]
+}
