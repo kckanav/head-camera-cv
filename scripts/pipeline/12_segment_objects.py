@@ -160,50 +160,101 @@ def propagate_view(predictor, frames_dir: Path, clicks_xy: list[list[float]],
     return masks
 
 
-def write_preview_video(left_dir: Path, right_dir: Path,
+def compute_raw_to_rect_maps(h: int, w: int,
+                             K: np.ndarray, dist: np.ndarray,
+                             R: np.ndarray, P: np.ndarray,
+                             ) -> tuple[np.ndarray, np.ndarray]:
+    """Per-pixel inverse rectification map: for each raw pixel (xr, yr),
+    return the rectified-image coords it lands at.
+
+    Suitable for `cv2.remap(rect_image, map_x, map_y)` to forward-warp a
+    rectified-space image (e.g. a SAM2 mask) back into raw image space.
+    """
+    grid_y, grid_x = np.mgrid[0:h, 0:w].astype(np.float32)
+    raw_pts = np.stack([grid_x, grid_y], axis=-1).reshape(-1, 1, 2)
+    rect_pts = cv2.undistortPoints(raw_pts, K, dist, R=R, P=P)
+    rect_pts = rect_pts.reshape(h, w, 2)
+    return (rect_pts[..., 0].astype(np.float32).copy(),
+            rect_pts[..., 1].astype(np.float32).copy())
+
+
+def write_preview_video(left_video_path: Path, right_video_path: Path,
+                        calib: dict,
                         masks_left: np.ndarray, masks_right: np.ndarray,
                         labels: list[str], fps: float, out_path: Path) -> None:
-    """Side-by-side rectified left | right with mask overlays. Streams
-    one frame at a time so we don't blow up memory."""
+    """Side-by-side **raw** left | right with mask overlays. Each
+    rectified-space SAM2 mask is warped back into raw-image space via
+    a per-pixel inverse rectification map, then alpha-blended onto the
+    raw frame. Streams frame-by-frame to keep memory bounded.
+
+    We render on raw frames (not rectified) because the saved alpha=1
+    rectification produces a small curved valid region surrounded by
+    black ("two small spheres"), which is hard to read for human eyes.
+    """
     n = masks_left.shape[0]
     K = masks_left.shape[1]
+    h_rect, w_rect = masks_left.shape[2:]
 
-    left_files = sorted(left_dir.glob("*.jpg"))[:n]
-    right_files = sorted(right_dir.glob("*.jpg"))[:n]
+    cap_l = cv2.VideoCapture(str(left_video_path))
+    cap_r = cv2.VideoCapture(str(right_video_path))
+    w_raw = int(cap_l.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h_raw = int(cap_l.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    sample = cv2.imread(str(left_files[0]))
-    h, w = sample.shape[:2]
+    # Build raw -> rect lookup maps once per view.
+    raw2rect_l_x, raw2rect_l_y = compute_raw_to_rect_maps(
+        h_raw, w_raw,
+        calib["K_left"], calib["dist_left"], calib["R1"], calib["P1"])
+    raw2rect_r_x, raw2rect_r_y = compute_raw_to_rect_maps(
+        h_raw, w_raw,
+        calib["K_right"], calib["dist_right"], calib["R2"], calib["P2"])
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w * 2, h))
+    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w_raw * 2, h_raw))
     if not writer.isOpened():
+        cap_l.release(); cap_r.release()
         sys.exit(f"failed to open VideoWriter at {out_path}")
 
-    for i in range(n):
-        l = cv2.imread(str(left_files[i]))
-        r = cv2.imread(str(right_files[i]))
-        for k in range(K):
-            color = np.array(OVERLAY_COLORS_BGR[k % len(OVERLAY_COLORS_BGR)],
-                             dtype=np.uint8)
-            sel_l = masks_left[i, k]
-            sel_r = masks_right[i, k]
-            if sel_l.any():
-                l[sel_l] = (0.5 * l[sel_l] + 0.5 * color).astype(np.uint8)
-            if sel_r.any():
-                r[sel_r] = (0.5 * r[sel_r] + 0.5 * color).astype(np.uint8)
+    try:
+        for i in range(n):
+            ok_l, l = cap_l.read()
+            ok_r, r = cap_r.read()
+            if not (ok_l and ok_r):
+                break
 
-        # Label legend, top-left of left view (drawn once per frame to
-        # survive the alpha blend above).
-        for k, lab in enumerate(labels):
-            color = OVERLAY_COLORS_BGR[k % len(OVERLAY_COLORS_BGR)]
-            cv2.rectangle(l, (8, 8 + 22 * k), (28, 24 + 22 * k), color, -1)
-            cv2.putText(l, lab, (34, 24 + 22 * k),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1,
-                        cv2.LINE_AA)
+            for k in range(K):
+                color = np.array(OVERLAY_COLORS_BGR[k % len(OVERLAY_COLORS_BGR)],
+                                 dtype=np.uint8)
+                rect_mask_l = (masks_left[i, k].astype(np.uint8) * 255)
+                raw_mask_l = cv2.remap(rect_mask_l, raw2rect_l_x, raw2rect_l_y,
+                                       cv2.INTER_NEAREST,
+                                       borderMode=cv2.BORDER_CONSTANT,
+                                       borderValue=0)
+                sel_l = raw_mask_l > 127
+                if sel_l.any():
+                    l[sel_l] = (0.5 * l[sel_l] + 0.5 * color).astype(np.uint8)
 
-        writer.write(np.hstack([l, r]))
+                rect_mask_r = (masks_right[i, k].astype(np.uint8) * 255)
+                raw_mask_r = cv2.remap(rect_mask_r, raw2rect_r_x, raw2rect_r_y,
+                                       cv2.INTER_NEAREST,
+                                       borderMode=cv2.BORDER_CONSTANT,
+                                       borderValue=0)
+                sel_r = raw_mask_r > 127
+                if sel_r.any():
+                    r[sel_r] = (0.5 * r[sel_r] + 0.5 * color).astype(np.uint8)
 
-    writer.release()
+            # Label legend, top-left of left view.
+            for k, lab in enumerate(labels):
+                color = OVERLAY_COLORS_BGR[k % len(OVERLAY_COLORS_BGR)]
+                cv2.rectangle(l, (8, 8 + 22 * k), (28, 24 + 22 * k), color, -1)
+                cv2.putText(l, lab, (34, 24 + 22 * k),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1,
+                            cv2.LINE_AA)
+
+            writer.write(np.hstack([l, r]))
+    finally:
+        cap_l.release()
+        cap_r.release()
+        writer.release()
 
 
 def main() -> None:
@@ -335,7 +386,8 @@ def main() -> None:
         out_video = (PROJECT_ROOT
                      / f"outputs/{today_pretty()} - object masks [{tag}] preview.mp4")
         print(f"\nrendering preview → {out_video.name}...")
-        write_preview_video(left_dir, right_dir, masks_left, masks_right,
+        write_preview_video(cam1_path, cam0_path, calib,
+                            masks_left, masks_right,
                             labels, fps, out_video)
         print(f"  done")
     finally:
