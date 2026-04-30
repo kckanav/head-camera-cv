@@ -55,26 +55,21 @@ from nicegui import app, ui
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DIR = PROJECT_ROOT / "outputs/30th April 2026 - mesh sequence [20260430 manipulation]"
 SLOT_COLORS = ["#ffa500", "#1f77b4"]   # orange, blue (matches inspect_anchored.py)
-DEFAULT_FPS = 30
-
-# Three.js is Y-up; table frame is Z-up. Rotate Z-up -> Y-up via R_x(-90°):
-#   (X, Y, Z)_table  ->  (X, Z, -Y)_viewer
-# Applied as a 4x4 to every mesh at export time.
-ROT_Z_UP_TO_Y_UP = np.array([
-    [1, 0, 0, 0],
-    [0, 0, 1, 0],
-    [0, -1, 0, 0],
-    [0, 0, 0, 1],
-], dtype=np.float64)
+DEFAULT_FPS = 15   # 15 fps default — per-frame delete-and-re-add can't sustain 30 reliably
 
 
 def cache_obj_sequence(seq_dir: Path, cache_dir: Path) -> tuple[list, str | None]:
-    """Convert each frame's OBJ → per-slot STL files in cache_dir, applying
-    the Z-up → Y-up rotation. Returns:
+    """Convert each frame's OBJ → per-slot STL files in cache_dir.
+
+    Data is kept in **table frame** (Z up, marker at origin). The viewer
+    sets the Three.js camera's up vector to +Z so the data displays
+    naturally without pre-rotation.
+
+    Returns:
       frame_slots: list of (slot0_filename or None, slot1_filename or None),
-        one per frame, indexing into cache_dir.
-      scene_filename: filename of the static scene helper (table + marker)
-        in cache_dir, or None if no scene.obj was found in seq_dir.
+        one per frame.
+      scene_filename: filename of the static scene helper (table + marker),
+        or None if no scene.obj was in seq_dir.
     """
     obj_files = sorted(seq_dir.glob("mesh_*.obj"))
     if not obj_files:
@@ -92,7 +87,6 @@ def cache_obj_sequence(seq_dir: Path, cache_dir: Path) -> tuple[list, str | None
         for name, geom in scene_obj.geometry.items():
             for s in (0, 1):
                 if f"slot{s}" in name:
-                    geom.apply_transform(ROT_Z_UP_TO_Y_UP)
                     fname = f"frame_{i:04d}_slot{s}.stl"
                     geom.export(str(cache_dir / fname))
                     slots[s] = fname
@@ -106,7 +100,6 @@ def cache_obj_sequence(seq_dir: Path, cache_dir: Path) -> tuple[list, str | None
     if scene_path.exists():
         sd = trimesh.load(str(scene_path), force="scene", skip_materials=True)
         combined = trimesh.util.concatenate(list(sd.geometry.values()))
-        combined.apply_transform(ROT_Z_UP_TO_Y_UP)
         scene_filename = "scene.stl"
         combined.export(str(cache_dir / scene_filename))
 
@@ -147,21 +140,25 @@ def main():
         # Left: 3D scene
         with ui.column().classes("flex-grow h-full"):
             scene = ui.scene().classes("w-full h-full")
-            # Camera: looking down at the table plane from above-and-side.
+            # Tell Three.js that +Z is up (matches our table frame). Camera
+            # placed off-axis so all three axes are visible from the start.
             scene.move_camera(
-                x=0.6, y=0.5, z=0.6,        # in viewer (Y-up) coords
-                look_at_x=0.15, look_at_y=0.05, look_at_z=0.0,
+                x=0.6, y=-0.5, z=0.5,
+                look_at_x=0.15, look_at_y=0.0, look_at_z=0.05,
+                up_x=0, up_y=0, up_z=1,
             )
 
-            # Static scene helper (table plane + marker outline).
+            # Static scene helper (table plane at Z=0 + marker outline).
             if scene_filename is not None:
                 scene.stl(f"/cache/{scene_filename}").material("#666666", opacity=0.5)
 
-            # Tiny RGB world axes at origin (in viewer coords; XYZ = R G B).
+            # World axes in TABLE FRAME (X=red, Y=green, Z=blue). Both X and
+            # Y lie on the table plane; Z stands up — that's the natural
+            # reading: red & green outline the table base, blue is up.
             ax = 0.06
-            scene.box(width=ax, height=0.003, depth=0.003).move(ax / 2, 0, 0).material("#ff3333")
-            scene.box(width=0.003, height=ax, depth=0.003).move(0, ax / 2, 0).material("#33ff33")
-            scene.box(width=0.003, height=0.003, depth=ax).move(0, 0, ax / 2).material("#3366ff")
+            scene.box(width=ax, height=0.003, depth=0.003).move(ax / 2, 0, 0).material("#ff3333")  # +X red
+            scene.box(width=0.003, height=ax, depth=0.003).move(0, ax / 2, 0).material("#33ff33")  # +Y green
+            scene.box(width=0.003, height=0.003, depth=ax).move(0, 0, ax / 2).material("#3366ff")  # +Z blue (up)
 
             # Two slot meshes — handles to the currently-displayed STLs.
             slot_handles: list = [None, None]
@@ -217,12 +214,12 @@ def main():
                 ui.button("+1 ⏭", on_click=step_forward)
 
             ui.separator()
-            ui.label("Coordinate frame").classes("font-bold mt-2")
+            ui.label("Coordinate frame (table)").classes("font-bold mt-2")
             ui.html(
                 "• Origin: ArUco marker centre on the table.<br>"
-                "• Marker outline + table plane at viewer Y=0.<br>"
-                "• Table-frame +Z is up → mapped to viewer +Y.<br>"
-                "• Table-frame +X / +Y stay in the table plane.<br>"
+                "• <span style='color:#ff3333'>+X red</span>: along marker's first edge.<br>"
+                "• <span style='color:#33ff33'>+Y green</span>: along marker's second edge.<br>"
+                "• <span style='color:#3366ff'>+Z blue</span>: up from the table.<br>"
                 "• Units: metres.",
                 sanitize=False,
             ).classes("text-xs text-gray-300 leading-relaxed")
